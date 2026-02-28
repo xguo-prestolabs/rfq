@@ -12,6 +12,7 @@ from absl import app, flags, logging
 from typing import Set
 
 from ws_base import Message, MsgType, parse_config
+from latency_monitor import get_latency_monitor, record_message_latency
 
 """
 Interception/filtering is done here by the WsServer.
@@ -39,6 +40,7 @@ class WsServer:
         self.in_queue = in_queue
         self.config = config
         self.verbose_log = config.get("verbose_log", False)
+        self.latency_monitor = get_latency_monitor()
 
     def login_response(self, msg) -> str:
         raise NotImplementedError(f"Subclass must implement this method: {msg}")
@@ -80,18 +82,18 @@ class WsServer:
                         # do not forward
                         continue
                     case MsgType.SUBSCRIBE:
-                        message = Message(MsgType.SUBSCRIBE, message)
+                        message = Message(MsgType.SUBSCRIBE, message, queue_entry_time=time.time_ns())
                     case MsgType.DATA:
-                        message = Message(MsgType.DATA, message)
+                        message = Message(MsgType.DATA, message, queue_entry_time=time.time_ns())
                     case MsgType.HEARTBEAT:
-                        message = Message(MsgType.HEARTBEAT, message)
+                        message = Message(MsgType.HEARTBEAT, message, queue_entry_time=time.time_ns())
                         await websocket.send(self.heartbeat_response(message))
                         continue
                     case MsgType.SERVER_COMMNAD:
                         self.handle_server_command(message)
                         continue
                     case MsgType.CLIENT_COMMAND:
-                        message = Message(MsgType.CLIENT_COMMAND, message)
+                        message = Message(MsgType.CLIENT_COMMAND, message, queue_entry_time=time.time_ns())
                     case MsgType.INGORE:
                         # do not forward
                         continue
@@ -112,18 +114,55 @@ class WsServer:
     async def publish(self):
         while True:
             msg: Message = await self.in_queue.get()
+
+            # Record when we start processing (after dequeuing)
             msg.process_time = time.time_ns()
-            # ready_clients may change during the loop
-            for ws in self.ready_clients.copy():
-                try:
-                    await ws.send(msg.message)
-                except websockets.exceptions.ConnectionClosed:
-                    logging.info(f"Client disconnected: {ws.remote_address}")
+
+            # For HFT: parallel broadcast to minimize forward latency
+            if not self.ready_clients:
+                msg.discard_time = time.time_ns()
+                continue
+
+            # Create broadcast tasks for all clients simultaneously
+            tasks = []
+            clients_snapshot = self.ready_clients.copy()
+            msg.client_count = len(clients_snapshot)
+            msg.broadcast_start_time = time.time_ns()
+
+            for ws in clients_snapshot:
+                task = asyncio.create_task(self._send_to_client_safe(ws, msg.message))
+                tasks.append(task)
+
+            # Wait for all broadcasts to complete
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            msg.broadcast_complete_time = time.time_ns()
+
+            # Clean up disconnected clients
+            for ws, result in zip(clients_snapshot, results):
+                if isinstance(result, Exception):
+                    if isinstance(result, websockets.exceptions.ConnectionClosed):
+                        logging.info(f"Client disconnected: {ws.remote_address}")
+                    else:
+                        logging.error(f"Error sending to client {ws.remote_address}: {result}")
                     self.ready_clients.discard(ws)
-                except Exception as e:
-                    logging.error(f"Error sending to client {ws.remote_address}: {e}")
-                    self.ready_clients.discard(ws)
+
             msg.discard_time = time.time_ns()
+
+            # Record latency for HFT monitoring
+            record_message_latency(msg)
+
+    async def _send_to_client_safe(self, ws, message):
+        """Send message to a single client with exception handling"""
+        await ws.send(message)
+
+    def get_latency_stats(self) -> dict:
+        """Get current latency statistics for monitoring"""
+        stats = self.latency_monitor.get_latency_report()
+        return {
+            "server_type": "websocket_server",
+            "active_clients": len(self.ready_clients),
+            "latency_stats": stats
+        }
 
     async def ping(self):
         if self.config.get("ping_interval") is None:

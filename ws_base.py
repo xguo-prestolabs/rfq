@@ -3,9 +3,10 @@
 
 import enum
 import json
+import time
 import pathlib
 from typing import Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 
 
 class MsgType(enum.IntEnum):
@@ -25,6 +26,24 @@ class Message:
     fetch_time: Optional[int] = None
     process_time: Optional[int] = None
     discard_time: Optional[int] = None
+    # HFT latency tracking
+    queue_entry_time: Optional[int] = None  # When message enters input queue
+    broadcast_start_time: Optional[int] = None  # When broadcast begins
+    broadcast_complete_time: Optional[int] = None  # When all clients receive message
+    client_count: Optional[int] = None  # Number of clients message was sent to
+    
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        try:
+            message = json.loads(self.message)
+            d["message"] = message
+        except Exception as e:
+            pass
+        return d
+    
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict())
+
 
 
 def _exapnd_trade_key(config: dict) -> dict:
@@ -44,3 +63,17 @@ def parse_config(config_path: pathlib.Path) -> dict:
     content = pathlib.Path(config_path).read_text()
     config = json.loads(content)
     return _exapnd_trade_key(config)
+
+
+class Writer:
+    def __init__(self):
+        self._path = f"messages_{time.time_ns()}.txt"
+        self._fp = open(self._path, "a", encoding="utf-8")
+
+    def write(self, message: Message):
+        self._fp.write(message.to_json())
+        self._fp.write("\n")
+        self._fp.flush()
+
+    def close(self):
+        self._fp.close()

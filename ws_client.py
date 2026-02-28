@@ -11,11 +11,12 @@ import hashlib
 import base64
 import ssl
 import certifi
+from pymongo import MongoClient
 
 from absl import app, flags, logging
-from typing import Set
+from typing import Set, Optional, Dict
 from websockets.legacy.protocol import WebSocketCommonProtocol
-from ws_base import Message, MsgType, parse_config
+from ws_base import Message, MsgType, parse_config, Writer
 
 
 class WsClient:
@@ -27,6 +28,25 @@ class WsClient:
         self.config = config
         self.in_queue = in_queue
         self.subscription_msg = config.get("subscription", None)
+        self.writer = Writer()
+
+        # For request-response pattern (used by DeribitWsClient)
+        self.pending_requests: Dict[str, asyncio.Future] = {}
+        self.mongo_client = None
+        self.mongo_db = None
+        self.mongo_collection = None
+
+        if config.get("mongodb", {}).get("enabled", False):
+            mongo_config = config["mongodb"]
+            mongo_uri = mongo_config.get("uri", "mongodb://localhost:27017/")
+            self.mongo_client = MongoClient(mongo_uri)
+            self.mongo_db = self.mongo_client[
+                mongo_config.get("database", "deribit_block_rfq")
+            ]
+            self.mongo_collection = self.mongo_db[
+                mongo_config.get("collection", "messages")
+            ]
+            logging.info(f"MongoDB connection established: {mongo_uri}")
 
     async def login(self, ws: WebSocketCommonProtocol):
         raise NotImplementedError("Subclasses must implement this method")
@@ -46,6 +66,14 @@ class WsClient:
     def need_publish(self, message: str) -> bool:
         raise NotImplementedError("Subclasses must implement this method")
 
+    def close(self):
+        if self.mongo_client is not None:
+            try:
+                self.mongo_client.close()
+                logging.info("MongoDB connection closed")
+            except Exception as e:
+                logging.error(f"Error closing MongoDB connection: {e}")
+
     async def connect(self):
         url = self.config["server"]
         use_ssl = url.startswith("wss://")
@@ -60,36 +88,101 @@ class WsClient:
             ping_interval=20,
             close_timeout=5,
             max_queue=1024,
+            compression=None,  # no compression
             ssl=ssl_context,
         )
         logging.info(f"Connected to WebSocket: {url}")
 
-        # After login, the session should be authenticated and ready to subscribe.
+        self.conn = ws
+
+        # Start message loop as a background task FIRST
+        # so it can route responses for login/subscribe
+        message_loop_task = asyncio.create_task(
+            self._message_loop(ws), name="message_loop"
+        )
+
+        # Give the loop a moment to start
+        await asyncio.sleep(0.1)
+
+        # Now we can do login/subscribe which will use request-response pattern
         await self.login(ws)
         logging.info(f"Login success")
 
         await self.check_auth(ws)
         logging.info(f"Auth check success")
 
-        self.conn = ws
-        task = asyncio.create_task(self._periodic_health_check(), name="health_check")
         if self.subscription_msg:
             await self.subscribe(ws)
             logging.info(f"Subscription success")
 
-        async for message in ws:
-            message = Message(
-                msg_type=MsgType.DATA, fetch_time=time.time_ns(), message=message
-            )
-            if self.need_publish(message.message):
-                # logging.info(f"Publishing message: {message.message}")
-                await self.in_queue.put(message)
-            else:
-                logging.info(f"Ignoring message: {message}")
+        # Start health check task
+        health_check_task = asyncio.create_task(
+            self._periodic_health_check(), name="health_check"
+        )
 
-        await task
-        self.conn = None
-        raise RuntimeError("Connection closed")
+        try:
+            # Wait for message loop to complete (it runs until connection closes)
+            await message_loop_task
+        except Exception as e:
+            logging.error(f"Message loop failed: {e}")
+            raise  # Re-raise to trigger reconnection
+        finally:
+            # Cancel tasks
+            health_check_task.cancel()
+            message_loop_task.cancel()
+            try:
+                await health_check_task
+            except asyncio.CancelledError:
+                pass
+            try:
+                await message_loop_task
+            except asyncio.CancelledError:
+                pass
+
+            self.conn = None
+            logging.info("Connection closed")
+
+    async def _message_loop(self, ws: WebSocketCommonProtocol):
+        """Message loop that reads from WebSocket and routes messages"""
+        try:
+            async for raw_message in ws:
+                # Parse message to check if it's a response to a pending request
+                try:
+                    parsed = json.loads(raw_message)
+                    message_id = parsed.get("id")
+
+                    # Check if this is a response to a pending request
+                    if message_id and message_id in self.pending_requests:
+                        future = self.pending_requests[message_id]
+                        if not future.done():
+                            future.set_result(parsed)
+                        continue  # Don't process this message further
+                except (json.JSONDecodeError, KeyError):
+                    pass  # Not a JSON-RPC response, process as normal message
+
+                # Create Message object for normal messages
+                message = Message(
+                    msg_type=MsgType.DATA,
+                    fetch_time=time.time_ns(),
+                    message=raw_message,
+                )
+
+                if self.mongo_collection is not None:
+                    try:
+                        self.mongo_collection.insert_one(message.to_dict())
+                        logging.info(f"Saved to MongoDB: {message.to_json()}")
+                    except Exception as e:
+                        logging.error(f"Failed to save to MongoDB: {e}")
+                else:
+                    self.writer.write(message)
+
+                if self.need_publish(message.message) and self.mongo_collection is None:
+                    await self.in_queue.put(message)
+                else:
+                    logging.info(f"Ignoring message: {message.to_json()}")
+        except Exception as e:
+            logging.error(f"Message loop error: {e}")
+            raise
 
     async def _periodic_health_check(self):
         interval = self.config.get("ping_interval", 60)
@@ -98,22 +191,36 @@ class WsClient:
             await asyncio.sleep(interval)
 
     async def run(self):
-        await self.connect()
+        while True:
+            try:
+                await self.connect()
+                # If connect() completes without exception, connection closed gracefully
+                # Exit the loop instead of reconnecting
+                logging.info("Connection closed gracefully, exiting...")
+                break
+            except Exception as e:
+                logging.error(f"Connection error: {e}")
+                logging.info("Reconnecting in 5 seconds...")
+                await asyncio.sleep(5)
 
 
 class DeribitWsClient(WsClient):
     def __init__(self, config: dict, out_queue: asyncio.Queue, in_queue: asyncio.Queue):
-        super().__init__(config, out_queue, in_queue)
+        super().__init__(config, in_queue)
         self.request_id = 0
         self.id_prefix = f"wps_deribit_{id(self)}"
         self.last_auth_response = None
 
-    def _next_request_id(self) -> int:
+    def _next_request_id(self) -> str:
         self.request_id += 1
         return f"{self.id_prefix}_{self.request_id}"
 
     async def _send_jsonrpc(
-        self, ws: WebSocketCommonProtocol, method: str, params: dict = None
+        self,
+        ws: WebSocketCommonProtocol,
+        method: str,
+        params: dict = None,
+        timeout: float = 10.0,
     ) -> dict:
         request_id = self._next_request_id()
         request = {
@@ -122,10 +229,24 @@ class DeribitWsClient(WsClient):
             "method": method,
             "params": params or {},
         }
-        logging.info(f"Sending request: {json.dumps(request)}")
-        await ws.send(json.dumps(request))
-        result = await ws.recv()
-        return json.loads(result)
+
+        # Create a Future to wait for the response
+        future = asyncio.Future()
+        self.pending_requests[request_id] = future
+
+        try:
+            logging.info(f"Sending request: {json.dumps(request)}")
+            await ws.send(json.dumps(request))
+
+            # Wait for the response with timeout
+            result = await asyncio.wait_for(future, timeout=timeout)
+            return result
+        except asyncio.TimeoutError:
+            logging.error(f"Request {request_id} timed out after {timeout}s")
+            raise
+        finally:
+            # Clean up the pending request
+            self.pending_requests.pop(request_id, None)
 
     async def login(self, ws: WebSocketCommonProtocol):
         trade_key = self.config["trade_key"]
@@ -141,14 +262,15 @@ class DeribitWsClient(WsClient):
         assert response["result"]["access_token"], "Login failed"
 
     async def subscribe(self, ws: WebSocketCommonProtocol):
-        result = await self._send_request(ws, **self.subscription_msg)
+        result = await self._send_jsonrpc(ws, **self.subscription_msg)
         logging.info(f"Subscription done. Result: {result}")
 
     async def check_auth(self, ws: WebSocketCommonProtocol):
         method = "private/get_account_summary"
         params = {"currency": "BTC"}
         result = await self._send_jsonrpc(ws, method, params)
-        logging.info(f"Check auth response: {json.dumps(result, indent=2)}")
+        logging.log_first_n(logging.INFO, f"Check auth response: {json.dumps(result, indent=2)}", 1)
+
         if result.get("error"):
             raise RuntimeError(f"Check auth failed: {result.get('error')}")
 
@@ -304,5 +426,5 @@ def main(_):
 
 
 if __name__ == "__main__":
-    flags.DEFINE_string("config", "config/ws_client_config.json", "config file")
+    flags.DEFINE_string("config", "config/ws_client_config_mongodb.json", "config file")
     app.run(main)

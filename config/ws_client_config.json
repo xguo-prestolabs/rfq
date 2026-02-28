@@ -3,5 +3,20 @@
   "client_type": "deribit",
   "ping_interval": 10,
   "trade_key": "trade_key.json",
-  "scope": "session:cpp_og"
+  "scope": "session:cpp_og",
+   "subscription": {
+      "method": "public/subscribe",
+      "params": {
+        "channels": [
+          "block_rfq.maker.BTC",
+          "block_rfq.taker.BTC",
+	  "block_rfq.trades.BTC",
+	  "block_rfq.maker.quotes.BTC",
+          "block_rfq.maker.ETH",
+          "block_rfq.taker.ETH",
+	  "block_rfq.trades.ETH",
+	  "block_rfq.maker.quotes.ETH"
+        ]
+      }
+    }
 }
