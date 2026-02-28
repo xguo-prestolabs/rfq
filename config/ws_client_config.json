@@ -1,0 +1,7 @@
+{
+  "server": "wss://www.deribit.com/ws/api/v2",
+  "client_type": "deribit",
+  "ping_interval": 10,
+  "trade_key": "trade_key.json",
+  "scope": "session:cpp_og"
+}
