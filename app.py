@@ -1,8 +1,5 @@
-import asyncio
 import json
-import zmq
 import time
-import zmq.asyncio
 import redis.asyncio as redis
 import aiohttp
 import uuid
@@ -60,28 +57,19 @@ deribit_config = DeribitConfig()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Connect to Redis and start ZMQ listener
+    # Startup: Connect to Redis (ZMQ is handled by zmq_to_redis.py)
     app.state.redis_client = await redis.from_url(
         "redis://localhost:6379", decode_responses=True
     )
     print(f"Connected to Redis: {await app.state.redis_client.ping()}")
 
-    # Create aiohttp session for Deribit API calls
     app.state.http_session = aiohttp.ClientSession()
     print("HTTP session created for Deribit API")
-
-    app.state.zmq_task = asyncio.create_task(zmq_listener(app))
     get_mongo_connection(app)
 
     yield
 
-    # Shutdown: Cancel ZMQ listener and close Redis
-    app.state.zmq_task.cancel()
-    try:
-        await app.state.zmq_task
-    except asyncio.CancelledError:
-        pass
-
+    # Shutdown
     await app.state.redis_client.close()
     print("Redis connection closed")
     await app.state.mongo_client.close()
@@ -91,49 +79,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-
-
-async def zmq_listener(app: FastAPI):
-    """Background task to receive ZMQ messages and update Redis"""
-    context = zmq.asyncio.Context()
-    socket = context.socket(zmq.SUB)
-    zmq_url = "tcp://localhost:40000"
-    socket.connect(zmq_url)
-    socket.setsockopt_string(zmq.SUBSCRIBE, "")
-    print(f"ZMQ Subscriber listening on {zmq_url}")
-
-    try:
-        while True:
-            msg = await socket.recv_string()
-            try:
-                data = json.loads(msg)
-                if data.get("msg_type") == "fair_price":
-                    native_product = data["native_product"]
-                    await app.state.redis_client.set(
-                        f"price:{native_product}", json.dumps(data)
-                    )
-                elif data.get("msg_type") == "greeks":
-                    native_product = data["native_product"]
-                    await app.state.redis_client.set(
-                        f"greeks:{native_product}", json.dumps(data)
-                    )
-                elif data.get("msg_type") == "total_greeks":
-                    native_product = data["native_product"]
-                    await app.state.redis_client.set(
-                        f"total_greeks:{native_product}", json.dumps(data)
-                    )
-                else:
-                    pass
-            except json.JSONDecodeError as e:
-                print(f"Failed to parse message as JSON: {e}")
-            except Exception as e:
-                print(f"Error processing message: {e}")
-
-    except asyncio.CancelledError:
-        print("ZMQ listener cancelled")
-        socket.close()
-        context.term()
-        raise
 
 
 @app.get("/price/{product_name}")
