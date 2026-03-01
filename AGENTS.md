@@ -4,6 +4,46 @@ Guidance for human and AI agents working in this repository.
 
 ## 1) Project snapshot
 
+
+### System overview
+
+The system is a **multi-component RFQ (Request for Quote) pipeline**. Only part of this repo is in active use; the rest is legacy or unused.
+
+**In-repo components (what matters for agents):**
+
+| Component | Role | Status |
+|-----------|------|--------|
+| `app.py` | Subscribes to ZMQ from the C++ binary, stores JSON in **Redis**, exposes a **REST API** for the UI. | **Active** — main backend to improve. |
+| `block_rfq_ui.py` | Streamlit GUI; polls app’s API for RFQ requests, greeks, positions, fair prices; displays blocks per RFQ; user can submit/cancel/edit quotes. | **Active** — main UI to improve. |
+| `ws_client.py` | Subscribes to **Deribit RFQ channels**, persists messages to **MongoDB**. Only **DeribitWsClient** (and the subscribe → MongoDB path) is used. | **Active** for RFQ ingestion. |
+| `ws_server.py`, `ws_portal.py` | WebSocket server/portal. | **Not used** currently. |
+| OkexWsClient (in ws_client or related code) | Alternative exchange client. | **Not used**; only Deribit is used. |
+
+**External components (outside this repo):**
+
+- **C++ binary**: Connects to Deribit (futures/options feed, auth, order/trade/fill/account). Computes greeks (delta, gamma, vega), fair prices for options; **publishes JSON over ZMQ**.
+- **Redis**: Used by `app.py` for storing data from the C++ binary and for API-served state (e.g. recent RFQ requests, greeks, positions, fair prices).
+- **MongoDB**: Used by `ws_client.py` to store RFQ-related messages from Deribit.
+
+**Data flow (high level):**
+
+1. **C++ binary** → ZMQ (JSON) → **app.py** → Redis; **app.py** → REST API ← **block_rfq_ui.py** (polling).
+2. **Deribit** (RFQ channels) → **ws_client.py** (DeribitWsClient) → MongoDB. RFQ data in MongoDB may be consumed or mirrored elsewhere; app/UI get RFQ info via the API that app.py serves.
+3. User uses **block_rfq_ui.py** to see RFQs and pre-filled inputs (from RFQ + fair price/greeks from C++), then **submit**, **cancel**, or **edit** quotes. A **cancel-all** button is not implemented yet.
+
+**Run-order / dependencies:**
+
+To run the full pipeline you need (agents assume these are started manually when relevant):
+
+1. C++ binary (feeds + orders, greeks, fair prices, ZMQ publisher).
+2. MongoDB and Redis (storage).
+3. `app.py` (central API and ZMQ→Redis bridge).
+4. `block_rfq_ui.py` (GUI; refreshes every few seconds).
+5. `ws_client.py` (Deribit RFQ → MongoDB).
+
+Agents should focus improvements on **app.py** and **block_rfq_ui.py**; the C++ binary, MongoDB, Redis, and ws_client are launched manually.
+
+
 This repository is a Python service/tooling codebase centered on:
 
 - WebSocket client/server components (`ws_client.py`, `ws_server.py`, `ws_portal.py`)
