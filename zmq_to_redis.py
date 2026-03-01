@@ -1,8 +1,5 @@
-#!/usr/bin/env python3
-"""
-Standalone ZMQ subscriber: receives JSON from the C++ binary and writes to Redis.
-Run this separately; app.py only reads from Redis and MongoDB.
-"""
+# Copyright (c) 2026 Presto Labs Pte. Ltd.
+# Author: xguo
 
 import asyncio
 import json
