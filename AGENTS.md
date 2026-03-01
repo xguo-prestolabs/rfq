@@ -55,13 +55,15 @@ Dependency management is defined in `pyproject.toml` and `uv.lock` (use `uv`).
 
 ## 2) Environment and setup
 
-From the repository root:
+This repo uses **`~/venv`** as the project virtual environment. From the repository root:
 
 ```bash
+# Optional: load UV_PROJECT_ENVIRONMENT so uv uses ~/venv (otherwise uv uses .venv)
+source .env
 uv sync
 ```
 
-If `uv` is unavailable in your environment, install it first and then run `uv sync`.
+If you prefer to use the default `.venv`, omit `source .env`. If `uv` is unavailable, install it first and then run `uv sync`.
 
 ## 3) Common run commands
 
