@@ -81,6 +81,17 @@ uv run python ws_server.py --config <path-to-server-config.json>
 uv run python ws_portal.py --config <path-to-portal-config.json>
 ```
 
+**Deribit API test script** (uses `config.json` with test.deribit.com credentials; app must be running):
+
+```bash
+# Terminal 1: start the app
+uv run uvicorn app:app --host 0.0.0.0 --port 8000
+# Terminal 2: run tests
+uv run python test_deribit_api.py [--base-url http://localhost:8000] [--config config.json]
+```
+
+The script exercises: `/configure`, `ensure_authenticated`/`call_deribit_api` (via GET `/quotes`), `/quotes/add`, `/quotes`, `/quotes/edit`, `/quotes/cancel`, `/quotes/cancel_all`, and GET `/quotes/{quote_id}`.
+
 ## 4) Validation expectations
 
 There is no formal test suite checked in today. Before submitting changes:
@@ -88,7 +99,7 @@ There is no formal test suite checked in today. Before submitting changes:
 1. Run syntax checks:
 
 ```bash
-uv run python -m py_compile app.py ws_base.py ws_client.py ws_server.py ws_portal.py block_rfq_ui.py
+uv run python -m py_compile app.py ws_base.py ws_client.py ws_server.py ws_portal.py block_rfq_ui.py test_deribit_api.py
 ```
 
 2. Run a focused smoke test for the component you changed (API endpoint, websocket flow, or UI path).

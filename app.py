@@ -23,19 +23,22 @@ def get_mongo_connection(app: FastAPI):
 
 # Pydantic models for request validation
 class QuoteRequest(BaseModel):
-    block_rfq_id: str
-    price: float
+    block_rfq_id: int
     amount: float
+    direction: str  # maker's direction: "buy" or "sell"
+    legs: List[Dict[str, Any]]  # per-leg: instrument_name, direction, ratio, price
+    price: Optional[float] = None  # optional aggregate price (for future spreads)
 
 
 class EditQuoteRequest(BaseModel):
-    quote_id: str
-    price: float
+    quote_id: int  # block_rfq_quote_id on Deribit
     amount: float
+    legs: List[Dict[str, Any]]  # per-leg: instrument_name, direction, ratio, price
+    price: Optional[float] = None  # optional aggregate price
 
 
 class CancelQuoteRequest(BaseModel):
-    quote_id: str
+    quote_id: int  # block_rfq_quote_id on Deribit
 
 
 class CancelAllQuotesRequest(BaseModel):
@@ -203,7 +206,7 @@ async def get_rfq_status(rfq_id: str, request: Request):
                 "private/get_block_rfqs",
                 {"currency": "BTC"}
             )
-            for rfq in btc_rfqs:
+            for rfq in btc_rfqs.get("block_rfqs", []):
                 if rfq.get("block_rfq_id") == rfq_id:
                     return {
                         "status": "success",
@@ -220,7 +223,7 @@ async def get_rfq_status(rfq_id: str, request: Request):
             "private/get_block_rfqs",
             {"currency": "ETH"}
         )
-        for rfq in eth_rfqs:
+        for rfq in eth_rfqs.get("block_rfqs", []):
             if rfq.get("block_rfq_id") == rfq_id:
                 return {
                     "status": "success",
@@ -409,9 +412,12 @@ async def add_quote(quote: QuoteRequest, request: Request):
 
     params = {
         "block_rfq_id": quote.block_rfq_id,
-        "price": quote.price,
-        "amount": quote.amount
+        "amount": quote.amount,
+        "direction": quote.direction,
+        "legs": quote.legs,
     }
+    if quote.price is not None:
+        params["price"] = quote.price
 
     try:
         result = await call_deribit_api(
@@ -453,7 +459,7 @@ async def cancel_quote(cancel_req: CancelQuoteRequest, request: Request):
     session = request.app.state.http_session
 
     params = {
-        "quote_id": cancel_req.quote_id
+        "block_rfq_quote_id": cancel_req.quote_id
     }
 
     try:
@@ -495,10 +501,12 @@ async def edit_quote(edit_req: EditQuoteRequest, request: Request):
     session = request.app.state.http_session
 
     params = {
-        "quote_id": edit_req.quote_id,
-        "price": edit_req.price,
-        "amount": edit_req.amount
+        "block_rfq_quote_id": edit_req.quote_id,
+        "amount": edit_req.amount,
+        "legs": edit_req.legs,
     }
+    if edit_req.price is not None:
+        params["price"] = edit_req.price
 
     try:
         result = await call_deribit_api(
