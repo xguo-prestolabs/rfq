@@ -1,0 +1,957 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deribit Block RFQ – Market Maker</title>
+<style>
+/* ── Reset & variables ─────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:       #0d1117;
+  --surface:  #161b22;
+  --surface2: #21262d;
+  --border:   #30363d;
+  --accent:   #388bfd;
+  --accent2:  #58a6ff;
+  --success:  #3fb950;
+  --danger:   #f85149;
+  --warning:  #d29922;
+  --text:     #e6edf3;
+  --muted:    #8b949e;
+  --mono:     'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+  --sans:     -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --radius:   6px;
+  --sidebar-w: 270px;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  min-height: 100vh;
+}
+
+/* ── Layout ────────────────────────────────────────────────── */
+.layout { display: flex; min-height: 100vh; }
+
+.sidebar {
+  width: var(--sidebar-w);
+  min-width: var(--sidebar-w);
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  padding: 14px 12px;
+  overflow-y: auto;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.main {
+  flex: 1;
+  padding: 20px 24px;
+  min-width: 0;
+}
+
+/* ── Typography ────────────────────────────────────────────── */
+h1 { font-size: 20px; font-weight: 700; }
+h2 { font-size: 15px; font-weight: 600; margin-bottom: 12px; }
+h3 { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
+
+.page-header {
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 18px;
+}
+.page-header small { color: var(--muted); font-size: 12px; }
+
+.section-title {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--muted);
+  margin-bottom: 10px;
+  margin-top: 16px;
+}
+.section-title:first-child { margin-top: 0; }
+
+hr { border: none; border-top: 1px solid var(--border); margin: 14px 0; }
+
+/* ── Form controls ─────────────────────────────────────────── */
+label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 3px; }
+
+input[type="text"],
+input[type="password"],
+input[type="number"],
+select {
+  width: 100%;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  padding: 5px 9px;
+  font-size: 13px;
+  font-family: inherit;
+  margin-bottom: 8px;
+  transition: border-color .15s;
+}
+input:focus, select:focus { outline: none; border-color: var(--accent); }
+input[type="number"] { font-family: var(--mono); }
+input[type="checkbox"] { width: auto; accent-color: var(--accent); }
+
+.field { margin-bottom: 6px; }
+.row   { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+.row label  { margin-bottom: 0; min-width: 64px; white-space: nowrap; }
+.row input, .row select { margin-bottom: 0; flex: 1; min-width: 0; }
+.check-row { display: flex; align-items: center; gap: 6px; font-size: 13px; margin-bottom: 8px; }
+.check-row input { width: auto; }
+
+/* file picker */
+.file-label {
+  display: block;
+  text-align: center;
+  cursor: pointer;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 7px;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 10px;
+  transition: border-color .15s, color .15s;
+}
+.file-label:hover { border-color: var(--accent); color: var(--text); }
+#cfg-file { display: none; }
+
+/* ── Buttons ───────────────────────────────────────────────── */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 5px 13px;
+  border: none;
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  font-family: inherit;
+  white-space: nowrap;
+  transition: filter .15s;
+}
+.btn:disabled { opacity: .4; cursor: not-allowed; }
+.btn:not(:disabled):hover { filter: brightness(1.15); }
+
+.btn-primary { background: var(--accent);   color: #fff; }
+.btn-success { background: var(--success);  color: #fff; }
+.btn-danger  { background: var(--danger);   color: #fff; }
+.btn-warning { background: var(--warning);  color: #fff; }
+.btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text); }
+.btn-block   { width: 100%; margin-bottom: 6px; }
+.btn-sm      { padding: 3px 9px; font-size: 12px; }
+
+.btn-group { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+
+/* ── Status badge ──────────────────────────────────────────── */
+.badge {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.badge-open     { background: rgba(63,185,80,.15);  color: var(--success); }
+.badge-filled   { background: rgba(56,139,253,.15); color: var(--accent2); }
+.badge-canceled { background: rgba(248,81,73,.15);  color: var(--danger); }
+.badge-expired  { background: rgba(210,153,34,.15); color: var(--warning); }
+.badge-ok       { background: rgba(63,185,80,.15);  color: var(--success); }
+.badge-err      { background: rgba(248,81,73,.15);  color: var(--danger); }
+
+/* ── Tabs ──────────────────────────────────────────────────── */
+.tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 18px;
+}
+.tab-btn {
+  padding: 7px 14px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 14px;
+  font-family: inherit;
+  font-weight: 500;
+  transition: color .15s;
+  margin-bottom: -1px;
+}
+.tab-btn:hover  { color: var(--text); }
+.tab-btn.active { color: var(--text); border-bottom-color: var(--accent); }
+.tab-pane { display: none; }
+.tab-pane.active { display: block; }
+
+/* ── Table ─────────────────────────────────────────────────── */
+.tbl-wrap {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow-x: auto;
+  margin-bottom: 12px;
+}
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+thead th {
+  text-align: left;
+  padding: 6px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--muted);
+  background: var(--surface2);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+tbody tr { border-bottom: 1px solid var(--border); }
+tbody tr:last-child { border-bottom: none; }
+tbody tr.combo { background: rgba(56,139,253,.05); font-weight: 600; }
+tbody td { padding: 6px 10px; vertical-align: middle; }
+
+/* ── RFQ card ──────────────────────────────────────────────── */
+.rfq-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 10px;
+  overflow: hidden;
+}
+.rfq-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 14px;
+  cursor: pointer;
+  user-select: none;
+  background: var(--surface2);
+}
+.rfq-header:hover { background: #2a3040; }
+.rfq-id   { font-weight: 700; font-family: var(--mono); font-size: 13px; }
+.rfq-meta { flex: 1; font-size: 12px; color: var(--muted); }
+.chevron  { font-size: 11px; color: var(--muted); transition: transform .2s; }
+.rfq-card.expanded .chevron { transform: rotate(90deg); }
+
+.rfq-body { display: none; padding: 14px; }
+.rfq-card.expanded .rfq-body { display: block; }
+
+.rfq-grid {
+  display: grid;
+  grid-template-columns: 1fr 280px;
+  gap: 14px;
+}
+@media (max-width: 860px) { .rfq-grid { grid-template-columns: 1fr; } }
+
+/* ── Quote panel ───────────────────────────────────────────── */
+.quote-panel {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  align-self: start;
+}
+.quote-panel h3 { font-size: 13px; border-bottom: 1px solid var(--border); padding-bottom: 6px; margin-bottom: 10px; }
+.active-qid { font-size: 11px; color: var(--success); font-family: var(--mono); margin-top: 6px; min-height: 16px; }
+
+/* ── Hedge box ─────────────────────────────────────────────── */
+.hedge-box {
+  font-size: 12px;
+  color: var(--muted);
+  background: rgba(210,153,34,.07);
+  border: 1px solid rgba(210,153,34,.25);
+  border-radius: var(--radius);
+  padding: 5px 9px;
+  margin-bottom: 10px;
+}
+
+/* ── Meta row ──────────────────────────────────────────────── */
+.meta { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+.meta span { color: var(--text); }
+
+/* ── Alerts ────────────────────────────────────────────────── */
+.alert {
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+.alert-info    { background: rgba(56,139,253,.1);  border: 1px solid rgba(56,139,253,.25);  color: var(--accent2); }
+.alert-success { background: rgba(63,185,80,.1);   border: 1px solid rgba(63,185,80,.25);   color: var(--success); }
+.alert-danger  { background: rgba(248,81,73,.1);   border: 1px solid rgba(248,81,73,.25);   color: var(--danger); }
+.alert-warning { background: rgba(210,153,34,.1);  border: 1px solid rgba(210,153,34,.25);  color: var(--warning); }
+
+/* ── Toast ─────────────────────────────────────────────────── */
+#toasts {
+  position: fixed; top: 14px; right: 14px;
+  z-index: 9999;
+  display: flex; flex-direction: column; gap: 7px;
+  pointer-events: none;
+  max-width: 320px;
+}
+.toast {
+  padding: 9px 14px;
+  border-radius: var(--radius);
+  font-size: 13px;
+  font-weight: 500;
+  pointer-events: all;
+  animation: fadeIn .2s ease;
+  word-wrap: break-word;
+}
+.toast-success { background: #1c3a20; border: 1px solid var(--success); color: var(--success); }
+.toast-error   { background: #3a1c1c; border: 1px solid var(--danger);  color: var(--danger); }
+.toast-info    { background: #1c2a3a; border: 1px solid var(--accent);  color: var(--accent2); }
+@keyframes fadeIn { from { opacity: 0; transform: translateX(10px); } to { opacity: 1; transform: none; } }
+
+/* ── Spinner ───────────────────────────────────────────────── */
+.spin {
+  display: inline-block;
+  width: 14px; height: 14px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin .6s linear infinite;
+  vertical-align: middle;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.loading { text-align: center; padding: 32px; color: var(--muted); }
+
+/* ── Colour helpers ────────────────────────────────────────── */
+.pos  { color: var(--success); }
+.neg  { color: var(--danger); }
+.mono { font-family: var(--mono); }
+.dim  { color: var(--muted); }
+
+/* ── Bottom bar ────────────────────────────────────────────── */
+.bottom-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 20px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+}
+</style>
+</head>
+<body>
+
+<div id="toasts"></div>
+
+<div class="layout">
+
+  <!-- ═══════════ SIDEBAR ═══════════ -->
+  <aside class="sidebar">
+
+    <div class="section-title">⚙️ Configuration</div>
+
+    <label class="file-label" for="cfg-file">📂 Load config.json</label>
+    <input type="file" id="cfg-file" accept=".json">
+
+    <div class="field"><label>Client ID</label>
+      <input type="text" id="cid" placeholder="ro8V9wor"></div>
+    <div class="field"><label>Client Secret</label>
+      <input type="password" id="csecret" placeholder="••••••••"></div>
+    <div class="check-row">
+      <input type="checkbox" id="testnet" checked>
+      <label for="testnet">Testnet (test.deribit.com)</label>
+    </div>
+    <button class="btn btn-primary btn-block" onclick="configure()">🔑 Configure</button>
+    <div id="cfg-status" style="margin-bottom:4px"></div>
+
+    <hr>
+
+    <div class="section-title">🚨 Cancel All Quotes</div>
+    <div class="field"><label>Currency</label>
+      <select id="cancel-cur">
+        <option value="all">All</option>
+        <option value="BTC">BTC</option>
+        <option value="ETH">ETH</option>
+      </select>
+    </div>
+    <button class="btn btn-danger btn-block" onclick="cancelAll()">Cancel All Quotes</button>
+
+    <hr>
+
+    <div class="section-title">📊 Total Greeks</div>
+    <div id="greeks"><div class="loading"><span class="spin"></span></div></div>
+
+  </aside>
+
+  <!-- ═══════════ MAIN ═══════════ -->
+  <main class="main">
+
+    <div class="page-header">
+      <h1>Deribit Block RFQ</h1>
+      <small>Market Maker Dashboard</small>
+    </div>
+
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="rfqs"   onclick="switchTab(this)">📋 RFQs</button>
+      <button class="tab-btn"        data-tab="quotes" onclick="switchTab(this)">💬 My Quotes</button>
+    </div>
+
+    <div id="tab-rfqs" class="tab-pane active">
+      <div id="rfqs-container">
+        <div class="loading"><span class="spin"></span> Loading RFQs…</div>
+      </div>
+    </div>
+
+    <div id="tab-quotes" class="tab-pane">
+      <div id="quotes-container">
+        <div class="loading"><span class="spin"></span> Loading quotes…</div>
+      </div>
+    </div>
+
+    <div class="bottom-bar">
+      <div class="check-row">
+        <input type="checkbox" id="auto-refresh" onchange="toggleAutoRefresh()">
+        <label for="auto-refresh">Auto-refresh (5 s)</label>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button class="btn btn-outline btn-sm" onclick="refresh()">🔄 Refresh</button>
+        <span id="ts" class="dim">—</span>
+      </div>
+    </div>
+
+  </main>
+</div><!-- end .layout -->
+
+<script>
+'use strict';
+
+/* ═══════════════════════════════════════════════════════════════
+   Constants & state
+═══════════════════════════════════════════════════════════════ */
+const BASE = 'http://127.0.0.1:8000';
+
+const S = {
+  tab:      'rfqs',
+  quoteIds: {},   // rfqId (str) → block_rfq_quote_id (int)
+  rfqCache: {},   // rfqId (str) → enriched rfq object
+  timer:    null,
+};
+
+/* ═══════════════════════════════════════════════════════════════
+   API
+═══════════════════════════════════════════════════════════════ */
+async function GET(path) {
+  return fetch(BASE + path);
+}
+
+async function POST(path, body, params) {
+  let url = BASE + path;
+  if (params) url += '?' + new URLSearchParams(params);
+  return fetch(url, {
+    method:  'POST',
+    headers: body ? { 'Content-Type': 'application/json' } : {},
+    body:    body ? JSON.stringify(body) : undefined,
+  });
+}
+
+async function errMsg(resp) {
+  try { const d = await resp.clone().json(); return d.detail || d.message || resp.statusText; }
+  catch { return resp.statusText; }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Toast
+═══════════════════════════════════════════════════════════════ */
+function toast(msg, type = 'info', ms = 4500) {
+  const el = document.createElement('div');
+  el.className = `toast toast-${type}`;
+  el.textContent = msg;
+  document.getElementById('toasts').appendChild(el);
+  setTimeout(() => el.remove(), ms);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Tabs
+═══════════════════════════════════════════════════════════════ */
+function switchTab(btn) {
+  S.tab = btn.dataset.tab;
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b === btn));
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.toggle('active', p.id === `tab-${S.tab}`));
+  refresh();
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Auto-refresh
+═══════════════════════════════════════════════════════════════ */
+function toggleAutoRefresh() {
+  clearInterval(S.timer);
+  if (document.getElementById('auto-refresh').checked)
+    S.timer = setInterval(refresh, 5000);
+}
+
+function refresh() {
+  if (S.tab === 'rfqs') loadRFQs(); else loadQuotes();
+  document.getElementById('ts').textContent = new Date().toLocaleTimeString();
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Config file picker
+═══════════════════════════════════════════════════════════════ */
+document.getElementById('cfg-file').addEventListener('change', e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = ev => {
+    try {
+      const cfg = JSON.parse(ev.target.result);
+      if (cfg.client_id)     document.getElementById('cid').value     = cfg.client_id;
+      if (cfg.client_secret) document.getElementById('csecret').value = cfg.client_secret;
+      toast('Credentials loaded from config.json', 'success');
+    } catch (err) { toast('Failed to parse config.json: ' + err.message, 'error'); }
+  };
+  reader.readAsText(file);
+});
+
+/* ═══════════════════════════════════════════════════════════════
+   Configure
+═══════════════════════════════════════════════════════════════ */
+async function configure() {
+  const cid  = document.getElementById('cid').value.trim();
+  const csec = document.getElementById('csecret').value.trim();
+  const tn   = document.getElementById('testnet').checked;
+  if (!cid || !csec) { toast('Enter Client ID and Secret', 'error'); return; }
+
+  try {
+    const resp = await POST('/configure', null, { client_id: cid, client_secret: csec, testnet: tn });
+    const data = await resp.json();
+    const el   = document.getElementById('cfg-status');
+    if (resp.ok) {
+      el.innerHTML = '<span class="badge badge-ok">✅ Connected</span>';
+      toast(data.message || 'Configured', 'success');
+      refresh(); loadGreeks();
+    } else {
+      el.innerHTML = '<span class="badge badge-err">❌ Failed</span>';
+      toast('Configure failed: ' + (data.detail || resp.statusText), 'error');
+    }
+  } catch (e) {
+    toast(`Cannot reach ${BASE} — is app.py running?`, 'error');
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Cancel All
+═══════════════════════════════════════════════════════════════ */
+async function cancelAll() {
+  const cur  = document.getElementById('cancel-cur').value;
+  const body = cur === 'all' ? {} : { currency: cur };
+  try {
+    const resp = await POST('/quotes/cancel_all', body);
+    const data = await resp.json();
+    if (resp.ok) {
+      const n = data.result ?? 0;
+      for (const k of Object.keys(S.quoteIds)) delete S.quoteIds[k];
+      toast(`Cancelled ${n} quote(s)`, 'success');
+      refresh();
+    } else {
+      toast('Cancel all failed: ' + (data.detail || resp.statusText), 'error');
+    }
+  } catch (e) { toast('Error: ' + e.message, 'error'); }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Total Greeks (sidebar)
+═══════════════════════════════════════════════════════════════ */
+async function loadGreeks() {
+  const el = document.getElementById('greeks');
+  try {
+    const resp = await GET('/total_greeks');
+    if (!resp.ok) { el.innerHTML = '<p class="dim" style="font-size:12px">Unavailable</p>'; return; }
+    const data = await resp.json();
+    const g    = data.total_greeks || {};
+    const skip = new Set(['ts', 'trade_key', 'msg_type', 'native_product']);
+    const rows = Object.entries(g)
+      .filter(([k]) => !skip.has(k))
+      .map(([k, v]) => {
+        const n  = parseFloat(v);
+        const cls = isNaN(n) ? '' : (n >= 0 ? 'pos' : 'neg');
+        const txt = isNaN(n) ? esc(String(v)) : n.toFixed(4);
+        return `<tr>
+          <td style="font-size:11px;color:var(--muted);padding:3px 6px">${esc(k)}</td>
+          <td class="mono ${cls}" style="text-align:right;font-size:12px;padding:3px 6px">${txt}</td>
+        </tr>`;
+      }).join('');
+    el.innerHTML = rows
+      ? `<div class="tbl-wrap"><table><tbody>${rows}</tbody></table></div>`
+      : '<p class="dim" style="font-size:12px">No data</p>';
+  } catch { el.innerHTML = '<p class="dim" style="font-size:12px">Unavailable</p>'; }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   RFQs Tab
+═══════════════════════════════════════════════════════════════ */
+async function loadRFQs() {
+  const cont = document.getElementById('rfqs-container');
+  cont.innerHTML = '<div class="loading"><span class="spin"></span> Loading…</div>';
+  try {
+    const resp = await GET('/rfqs');
+    if (!resp.ok) {
+      cont.innerHTML = `<div class="alert alert-danger">Failed to load RFQs (${resp.status})</div>`;
+      return;
+    }
+    const rfqs = await resp.json();
+    const ids  = Object.keys(rfqs).sort((a, b) => parseInt(b) - parseInt(a));
+    if (!ids.length) { cont.innerHTML = '<div class="alert alert-info">No active RFQs</div>'; return; }
+
+    // Enrich all RFQs (fetch prices + greeks per leg) in parallel
+    const enriched = await Promise.all(ids.map(id => enrichRFQ(id, rfqs[id])));
+    for (const { id, rfq } of enriched) S.rfqCache[id] = rfq;
+
+    cont.innerHTML = enriched.map(({ id, rfq }) => rfqCard(id, rfq)).join('');
+
+    // Restore button states from remembered quoteIds
+    for (const id of ids) syncButtons(id);
+
+  } catch (e) {
+    cont.innerHTML = `<div class="alert alert-danger">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+async function enrichRFQ(id, rfq) {
+  const legs = (rfq.legs || []).map(l => ({ ...l }));
+  await Promise.all(legs.map(async leg => {
+    const p = encodeURIComponent(leg.instrument_name);
+    try {
+      const r = await GET(`/price/${p}`);
+      leg.fair_price = r.ok ? (await r.json()).price || 0 : 0;
+    } catch { leg.fair_price = 0; }
+    try {
+      const r = await GET(`/greeks/${p}`);
+      if (r.ok) { const g = (await r.json()).greeks || {}; leg.delta = g.delta||0; leg.gamma = g.gamma||0; leg.vega = g.vega||0; }
+      else { leg.delta = leg.gamma = leg.vega = 0; }
+    } catch { leg.delta = leg.gamma = leg.vega = 0; }
+  }));
+  return { id, rfq: { ...rfq, legs } };
+}
+
+function combo(rfq) {
+  const c = { instrument_name: rfq.combo_id || 'COMBO', direction: '—', ratio: '—', fair_price: 0, delta: 0, gamma: 0, vega: 0 };
+  for (const l of rfq.legs || []) {
+    const s = l.direction === 'buy' ? 1 : -1, r = (l.ratio || 1) * s;
+    c.fair_price += (l.fair_price || 0) * r;
+    c.delta      += (l.delta      || 0) * r;
+    c.gamma      += (l.gamma      || 0) * r;
+    c.vega       += (l.vega       || 0) * r;
+  }
+  return c;
+}
+
+function stateBadge(state) {
+  const cls  = { open: 'open', filled: 'filled', canceled: 'canceled', expired: 'expired' }[state] || 'open';
+  const icon = { open: '🟢', filled: '✅', canceled: '❌', expired: '⏰' }[state] || '⚪';
+  return `<span class="badge badge-${cls}">${icon} ${state}</span>`;
+}
+
+function fmtN(v, d = 4) {
+  const n = parseFloat(v);
+  return isNaN(n) ? esc(String(v)) : n.toFixed(d);
+}
+function fmtCell(v) {
+  const n = parseFloat(v);
+  if (isNaN(n)) return `<span>${esc(String(v))}</span>`;
+  return `<span class="mono ${n >= 0 ? 'pos' : 'neg'}">${n.toFixed(4)}</span>`;
+}
+
+function rfqCard(id, rfq) {
+  const legs     = rfq.legs || [];
+  const cmb      = combo(rfq);
+  const hedge    = rfq.hedge || null;
+  const isOpen   = rfq.state === 'open';
+  const cts      = new Date(rfq.creation_timestamp).toLocaleString();
+  const ets      = new Date(rfq.expiration_timestamp).toLocaleString();
+  const defDir   = (legs[0]?.direction === 'buy') ? 'sell' : 'buy';
+
+  // Legs table
+  const legRows = legs.map(l => `<tr>
+    <td class="mono" style="font-size:12px">${esc(l.instrument_name)}</td>
+    <td><span class="${l.direction === 'buy' ? 'pos' : 'neg'}">${l.direction}</span></td>
+    <td class="mono">${l.ratio}</td>
+    <td class="mono">${fmtN(l.fair_price, 8)}</td>
+    <td>${fmtCell(l.delta)}</td><td>${fmtCell(l.gamma)}</td><td>${fmtCell(l.vega)}</td>
+  </tr>`).join('');
+
+  const comboRow = `<tr class="combo">
+    <td class="mono" style="font-size:12px">${esc(cmb.instrument_name)}</td>
+    <td>${cmb.direction}</td><td>${cmb.ratio}</td>
+    <td class="mono">${fmtN(cmb.fair_price, 8)}</td>
+    <td>${fmtCell(cmb.delta)}</td><td>${fmtCell(cmb.gamma)}</td><td>${fmtCell(cmb.vega)}</td>
+  </tr>`;
+
+  const hedgeHtml = hedge ? `<div class="hedge-box">
+    ⚡ Hedge: <strong>${esc(hedge.instrument_name)}</strong>
+    &nbsp;${hedge.direction.toUpperCase()} qty=${hedge.amount} @ ${hedge.price}
+  </div>` : '';
+
+  // Per-leg price inputs
+  const legInputs = legs.map((l, i) => {
+    const shortName = l.instrument_name.split('-').slice(-2).join('-');
+    return `<div class="row" style="margin-bottom:5px">
+      <label style="min-width:0;flex:1;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+             title="${esc(l.instrument_name)}">${esc(shortName)}</label>
+      <input type="number" id="lp-${id}-${i}" value="${fmtN(l.fair_price, 8)}"
+             step="0.00000001" min="0"
+             style="width:110px;flex:none;font-size:12px;margin-bottom:0;text-align:right">
+    </div>`;
+  }).join('');
+
+  return `
+  <div class="rfq-card ${isOpen ? 'expanded' : ''}" id="rfq-${id}">
+    <div class="rfq-header" onclick="toggleCard('${id}')">
+      <div class="rfq-id">#${id}</div>
+      ${stateBadge(rfq.state)}
+      <div class="rfq-meta">${esc(rfq.combo_id || '')} &nbsp;·&nbsp; taker: ${esc(rfq.taker_rating || '—')}</div>
+      <div class="chevron">▶</div>
+    </div>
+    <div class="rfq-body">
+      <div class="meta">
+        📅 Created: <span>${cts}</span> &nbsp;·&nbsp;
+        ⏱ Expires: <span>${ets}</span> &nbsp;·&nbsp;
+        📦 Amount: <span>${rfq.amount}</span>
+      </div>
+      ${hedgeHtml}
+      <div class="rfq-grid">
+        <!-- Legs table -->
+        <div>
+          <div class="tbl-wrap">
+            <table>
+              <thead><tr>
+                <th>Instrument</th><th>Direction</th><th>Ratio</th>
+                <th>Fair Price</th><th>Delta</th><th>Gamma</th><th>Vega</th>
+              </tr></thead>
+              <tbody>${legRows}${comboRow}</tbody>
+            </table>
+          </div>
+        </div>
+        <!-- Quote panel -->
+        <div class="quote-panel">
+          <h3>Quote</h3>
+          <div class="row">
+            <label>Direction</label>
+            <select id="dir-${id}" style="width:80px;flex:none;margin-bottom:0">
+              <option value="sell" ${defDir === 'sell' ? 'selected' : ''}>sell</option>
+              <option value="buy"  ${defDir === 'buy'  ? 'selected' : ''}>buy</option>
+            </select>
+          </div>
+          <div class="row">
+            <label>Amount</label>
+            <input type="number" id="amt-${id}" value="${rfq.amount || 1}"
+                   step="0.01" min="0" style="width:110px;flex:none;text-align:right;margin-bottom:0">
+          </div>
+          <div style="font-size:11px;color:var(--muted);margin:6px 0 4px">Leg prices:</div>
+          ${legInputs}
+          <div class="btn-group">
+            <button id="btn-sub-${id}" class="btn btn-success btn-sm" onclick="submitQuote('${id}')">Submit</button>
+            <button id="btn-edt-${id}" class="btn btn-warning btn-sm" onclick="editQuote('${id}')"   disabled>Edit</button>
+            <button id="btn-can-${id}" class="btn btn-danger  btn-sm" onclick="cancelQuote('${id}')" disabled>Cancel</button>
+          </div>
+          <div class="active-qid" id="qinfo-${id}"></div>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
+function toggleCard(id) {
+  document.getElementById(`rfq-${id}`).classList.toggle('expanded');
+}
+
+function syncButtons(id) {
+  const qid  = S.quoteIds[id];
+  const bSub = document.getElementById(`btn-sub-${id}`);
+  const bEdt = document.getElementById(`btn-edt-${id}`);
+  const bCan = document.getElementById(`btn-can-${id}`);
+  const info = document.getElementById(`qinfo-${id}`);
+  if (!bSub) return;
+  bSub.disabled = !!qid;
+  bEdt.disabled = !qid;
+  bCan.disabled = !qid;
+  info.textContent = qid ? `Active quote ID: ${qid}` : '';
+}
+
+function collectLegs(id) {
+  const rfq = S.rfqCache[id];
+  if (!rfq) return [];
+  return (rfq.legs || []).map((l, i) => ({
+    instrument_name: l.instrument_name,
+    direction:        l.direction,
+    ratio:            l.ratio,
+    price:            parseFloat(document.getElementById(`lp-${id}-${i}`)?.value || 0),
+  }));
+}
+
+function collectHedge(id) {
+  const h = S.rfqCache[id]?.hedge;
+  if (!h) return null;
+  return { instrument_name: h.instrument_name, direction: h.direction, price: h.price, amount: h.amount };
+}
+
+async function submitQuote(id) {
+  const dir   = document.getElementById(`dir-${id}`).value;
+  const amt   = parseFloat(document.getElementById(`amt-${id}`).value);
+  const legs  = collectLegs(id);
+  const hedge = collectHedge(id);
+
+  const body = { block_rfq_id: parseInt(id), amount: amt, direction: dir, legs };
+  if (hedge) body.hedge = hedge;
+
+  try {
+    const resp = await POST('/quotes/add', body);
+    const data = await resp.json();
+    if (resp.ok) {
+      const qid = data.result?.block_rfq_quote_id ?? data.quote_id;
+      S.quoteIds[id] = qid;
+      syncButtons(id);
+      toast(`Submitted! Quote ID: ${qid}`, 'success');
+    } else {
+      toast('Submit failed: ' + (data.detail || resp.statusText), 'error');
+    }
+  } catch (e) { toast('Error: ' + e.message, 'error'); }
+}
+
+async function editQuote(id) {
+  const qid  = S.quoteIds[id];
+  if (!qid) { toast('No active quote to edit', 'error'); return; }
+  const amt   = parseFloat(document.getElementById(`amt-${id}`).value);
+  const legs  = collectLegs(id);
+  const hedge = collectHedge(id);
+
+  const body = { quote_id: qid, amount: amt, legs };
+  if (hedge) body.hedge = hedge;
+
+  try {
+    const resp = await POST('/quotes/edit', body);
+    const data = await resp.json();
+    if (resp.ok) toast(`Quote ${qid} updated`, 'success');
+    else toast('Edit failed: ' + (data.detail || resp.statusText), 'error');
+  } catch (e) { toast('Error: ' + e.message, 'error'); }
+}
+
+async function cancelQuote(id) {
+  const qid = S.quoteIds[id];
+  if (!qid) { toast('No active quote to cancel', 'error'); return; }
+  try {
+    const resp = await POST('/quotes/cancel', { quote_id: qid });
+    const data = await resp.json();
+    if (resp.ok) {
+      delete S.quoteIds[id];
+      syncButtons(id);
+      toast(`Quote ${qid} cancelled`, 'success');
+    } else {
+      toast('Cancel failed: ' + (data.detail || resp.statusText), 'error');
+    }
+  } catch (e) { toast('Error: ' + e.message, 'error'); }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Quotes Tab
+═══════════════════════════════════════════════════════════════ */
+async function loadQuotes() {
+  const cont = document.getElementById('quotes-container');
+  cont.innerHTML = '<div class="loading"><span class="spin"></span> Loading…</div>';
+  try {
+    const resp = await GET('/quotes');
+    if (!resp.ok) {
+      cont.innerHTML = `<div class="alert alert-danger">Failed to load quotes (${resp.status})</div>`;
+      return;
+    }
+    const data   = await resp.json();
+    const quotes = data.quotes || [];
+
+    if (!quotes.length) {
+      cont.innerHTML = `<div class="alert alert-info">No open quotes</div>${cancelByIdHtml()}`;
+      return;
+    }
+
+    const cols = ['block_rfq_quote_id', 'block_rfq_id', 'direction', 'amount', 'price', 'quote_state'];
+    const ths  = cols.map(c => `<th>${c.replace(/_/g, ' ')}</th>`).join('');
+    const trs  = quotes.map(q => {
+      const sc = { open: 'pos', cancelled: 'neg', filled: 'dim' }[q.quote_state] || '';
+      return `<tr>
+        <td class="mono">${q.block_rfq_quote_id ?? '—'}</td>
+        <td class="mono">${q.block_rfq_id ?? '—'}</td>
+        <td><span class="${q.direction === 'buy' ? 'pos' : 'neg'}">${q.direction}</span></td>
+        <td class="mono">${fmtN(q.amount, 4)}</td>
+        <td class="mono">${fmtN(q.price, 8)}</td>
+        <td><span class="${sc}">${q.quote_state ?? '—'}</span></td>
+      </tr>`;
+    }).join('');
+
+    cont.innerHTML = `
+      <div class="tbl-wrap">
+        <table><thead><tr>${ths}</tr></thead><tbody>${trs}</tbody></table>
+      </div>
+      ${cancelByIdHtml()}`;
+
+  } catch (e) {
+    cont.innerHTML = `<div class="alert alert-danger">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+function cancelByIdHtml() {
+  return `<hr>
+  <h3 style="margin-bottom:8px">Cancel a specific quote</h3>
+  <div style="display:flex;gap:8px;align-items:center">
+    <input type="number" id="cancel-qid" placeholder="Quote ID"
+           style="width:160px;margin:0">
+    <button class="btn btn-danger btn-sm" onclick="cancelById()">Cancel</button>
+  </div>`;
+}
+
+async function cancelById() {
+  const qid = parseInt(document.getElementById('cancel-qid').value);
+  if (isNaN(qid)) { toast('Enter a valid quote ID', 'error'); return; }
+  try {
+    const resp = await POST('/quotes/cancel', { quote_id: qid });
+    const data = await resp.json();
+    if (resp.ok) {
+      // Remove from RFQ-level state if we tracked it
+      for (const [k, v] of Object.entries(S.quoteIds)) {
+        if (v === qid) { delete S.quoteIds[k]; syncButtons(k); }
+      }
+      toast(`Quote ${qid} cancelled`, 'success');
+      loadQuotes();
+    } else {
+      toast('Cancel failed: ' + (data.detail || resp.statusText), 'error');
+    }
+  } catch (e) { toast('Error: ' + e.message, 'error'); }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Utilities
+═══════════════════════════════════════════════════════════════ */
+function esc(s) {
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Init
+═══════════════════════════════════════════════════════════════ */
+(function init() {
+  loadGreeks();
+  loadRFQs();
+})();
+</script>
+</body>
+</html>

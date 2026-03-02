@@ -5,6 +5,7 @@ import aiohttp
 import uuid
 
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from pymongo import MongoClient
 from bson import json_util
@@ -28,6 +29,7 @@ class QuoteRequest(BaseModel):
     direction: str  # maker's direction: "buy" or "sell"
     legs: List[Dict[str, Any]]  # per-leg: instrument_name, direction, ratio, price
     price: Optional[float] = None  # optional aggregate price (for future spreads)
+    hedge: Optional[Dict[str, Any]] = None  # optional hedge leg
 
 
 class EditQuoteRequest(BaseModel):
@@ -35,6 +37,7 @@ class EditQuoteRequest(BaseModel):
     amount: float
     legs: List[Dict[str, Any]]  # per-leg: instrument_name, direction, ratio, price
     price: Optional[float] = None  # optional aggregate price
+    hedge: Optional[Dict[str, Any]] = None  # optional hedge leg
 
 
 class CancelQuoteRequest(BaseModel):
@@ -82,6 +85,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/price/{product_name}")
@@ -418,6 +428,8 @@ async def add_quote(quote: QuoteRequest, request: Request):
     }
     if quote.price is not None:
         params["price"] = quote.price
+    if quote.hedge is not None:
+        params["hedge"] = quote.hedge
 
     try:
         result = await call_deribit_api(
@@ -507,6 +519,8 @@ async def edit_quote(edit_req: EditQuoteRequest, request: Request):
     }
     if edit_req.price is not None:
         params["price"] = edit_req.price
+    if edit_req.hedge is not None:
+        params["hedge"] = edit_req.hedge
 
     try:
         result = await call_deribit_api(
