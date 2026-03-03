@@ -335,6 +335,7 @@ tbody td { padding: 6px 10px; vertical-align: middle; }
 /* ── Colour helpers ────────────────────────────────────────── */
 .pos  { color: var(--success); }
 .neg  { color: var(--danger); }
+.warn { color: var(--warning); }
 .mono { font-family: var(--mono); }
 .dim  { color: var(--muted); }
 
@@ -437,27 +438,34 @@ tbody td { padding: 6px 10px; vertical-align: middle; }
 const BASE = '';
 
 const S = {
-  tab:      'rfqs',
-  quoteIds: {},   // rfqId (str) → block_rfq_quote_id (int)
-  rfqCache: {},   // rfqId (str) → enriched rfq object
-  timer:    null,
+  tab:       'rfqs',
+  quoteIds:  {},   // rfqId (str) → block_rfq_quote_id (int)
+  rfqCache:  {},   // rfqId (str) → enriched rfq object
+  timer:     null,
+  ttxTimer:  null, // per-second countdown timer
 };
 
 /* ═══════════════════════════════════════════════════════════════
    API
 ═══════════════════════════════════════════════════════════════ */
 async function GET(path) {
-  return fetch(BASE + path);
+  const t0 = performance.now();
+  const resp = await fetch(BASE + path);
+  console.log(`[GET]  ${path} — ${(performance.now() - t0).toFixed(0)} ms  (${resp.status})`);
+  return resp;
 }
 
 async function POST(path, body, params) {
   let url = BASE + path;
   if (params) url += '?' + new URLSearchParams(params);
-  return fetch(url, {
+  const t0 = performance.now();
+  const resp = await fetch(url, {
     method:  'POST',
     headers: body ? { 'Content-Type': 'application/json' } : {},
     body:    body ? JSON.stringify(body) : undefined,
   });
+  console.log(`[POST] ${path} — ${(performance.now() - t0).toFixed(0)} ms  (${resp.status})`);
+  return resp;
 }
 
 async function errMsg(resp) {
@@ -581,14 +589,36 @@ async function loadRFQs() {
     const ids  = Object.keys(rfqs).sort((a, b) => parseInt(b) - parseInt(a));
     if (!ids.length) { cont.innerHTML = '<div class="alert alert-info">No active RFQs</div>'; return; }
 
-    // Enrich all RFQs (fetch prices + greeks per leg) in parallel
-    const enriched = await Promise.all(ids.map(id => enrichRFQ(id, rfqs[id])));
-    for (const { id, rfq } of enriched) S.rfqCache[id] = rfq;
+    // Render placeholder skeletons immediately in sorted order so the page isn't blank
+    // while per-leg price/greeks queries are in flight.
+    cont.innerHTML = ids.map(id => `
+      <div id="rfq-placeholder-${id}" class="rfq-card">
+        <div class="rfq-header">
+          <div class="rfq-id">#${id}</div>
+          <div class="rfq-meta"><span class="spin"></span> Loading prices…</div>
+        </div>
+      </div>`).join('');
 
-    cont.innerHTML = enriched.map(({ id, rfq }) => rfqCard(id, rfq)).join('');
+    const openIds  = ids.filter(id => rfqs[id].state === 'open');
+    const otherIds = ids.filter(id => rfqs[id].state !== 'open');
 
-    // Restore button states from remembered quoteIds
-    for (const id of ids) syncButtons(id);
+    const renderOne = async id => {
+      const { id: rid, rfq } = await enrichRFQ(id, rfqs[id]);
+      S.rfqCache[rid] = rfq;
+      const placeholder = document.getElementById(`rfq-placeholder-${rid}`);
+      if (placeholder) {
+        placeholder.insertAdjacentHTML('afterend', rfqCard(rid, rfq));
+        placeholder.remove();
+      }
+      syncButtons(rid);
+    };
+
+    // Open RFQs are actionable — process their price/greeks queries first.
+    // Expired/cancelled/filled RFQs follow once all open ones are rendered.
+    await Promise.all(openIds.map(renderOne));
+    await Promise.all(otherIds.map(renderOne));
+
+    startCountdowns();
 
   } catch (e) {
     cont.innerHTML = `<div class="alert alert-danger">Error: ${esc(e.message)}</div>`;
@@ -601,8 +631,8 @@ async function enrichRFQ(id, rfq) {
     const p = encodeURIComponent(leg.instrument_name);
     try {
       const r = await GET(`/price/${p}`);
-      leg.fair_price = r.ok ? (await r.json()).price || 0 : 0;
-    } catch { leg.fair_price = 0; }
+      leg.fair_price = r.ok ? ((await r.json()).price ?? null) : null;
+    } catch { leg.fair_price = null; }
     try {
       const r = await GET(`/greeks/${p}`);
       if (r.ok) { const g = (await r.json()).greeks || {}; leg.delta = g.delta||0; leg.gamma = g.gamma||0; leg.vega = g.vega||0; }
@@ -613,28 +643,33 @@ async function enrichRFQ(id, rfq) {
 }
 
 function combo(rfq) {
-  const c = { instrument_name: rfq.combo_id || 'COMBO', direction: '—', ratio: '—', fair_price: 0, delta: 0, gamma: 0, vega: 0 };
+  const c = { instrument_name: rfq.combo_id || 'COMBO', direction: '—', ratio: '—', fair_price: null, delta: 0, gamma: 0, vega: 0 };
+  let priceSum = 0, allPrices = true;
   for (const l of rfq.legs || []) {
     const s = l.direction === 'buy' ? 1 : -1, r = (l.ratio || 1) * s;
-    c.fair_price += (l.fair_price || 0) * r;
-    c.delta      += (l.delta      || 0) * r;
-    c.gamma      += (l.gamma      || 0) * r;
-    c.vega       += (l.vega       || 0) * r;
+    if (l.fair_price === null || l.fair_price === undefined) { allPrices = false; }
+    else { priceSum += l.fair_price * r; }
+    c.delta += (l.delta || 0) * r;
+    c.gamma += (l.gamma || 0) * r;
+    c.vega  += (l.vega  || 0) * r;
   }
+  c.fair_price = allPrices ? priceSum : null;
   return c;
 }
 
 function stateBadge(state) {
-  const cls  = { open: 'open', filled: 'filled', canceled: 'canceled', expired: 'expired' }[state] || 'open';
-  const icon = { open: '🟢', filled: '✅', canceled: '❌', expired: '⏰' }[state] || '⚪';
+  const cls  = { open: 'open', filled: 'filled', canceled: 'canceled', cancelled: 'canceled', expired: 'expired' }[state] || 'open';
+  const icon = { open: '🟢', filled: '✅', canceled: '❌', cancelled: '❌', expired: '⏰' }[state] || '⚪';
   return `<span class="badge badge-${cls}">${icon} ${state}</span>`;
 }
 
 function fmtN(v, d = 4) {
+  if (v === null || v === undefined) return 'N/A';
   const n = parseFloat(v);
   return isNaN(n) ? esc(String(v)) : n.toFixed(d);
 }
 function fmtCell(v) {
+  if (v === null || v === undefined) return '<span class="dim">N/A</span>';
   const n = parseFloat(v);
   if (isNaN(n)) return `<span>${esc(String(v))}</span>`;
   return `<span class="mono ${n >= 0 ? 'pos' : 'neg'}">${n.toFixed(4)}</span>`;
@@ -673,11 +708,14 @@ function rfqCard(id, rfq) {
   // Per-leg price inputs
   const legInputs = legs.map((l, i) => {
     const shortName = l.instrument_name.split('-').slice(-2).join('-');
+    const hasPrice  = l.fair_price !== null && l.fair_price !== undefined;
     return `<div class="row" style="margin-bottom:5px">
       <label style="min-width:0;flex:1;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
              title="${esc(l.instrument_name)}">${esc(shortName)}</label>
-      <input type="number" id="lp-${id}-${i}" value="${fmtN(l.fair_price, 8)}"
-             step="0.00000001" min="0"
+      <input type="number" id="lp-${id}-${i}"
+             value="${hasPrice ? fmtN(l.fair_price, 4) : ''}"
+             placeholder="${hasPrice ? '' : 'N/A'}"
+             step="${OPTION_TICK_SIZE}" min="0"
              style="width:110px;flex:none;font-size:12px;margin-bottom:0;text-align:right">
     </div>`;
   }).join('');
@@ -694,6 +732,7 @@ function rfqCard(id, rfq) {
       <div class="meta">
         📅 Created: <span>${cts}</span> &nbsp;·&nbsp;
         ⏱ Expires: <span>${ets}</span> &nbsp;·&nbsp;
+        ⏳ TTX: <span id="ttx-${id}" class="mono">—</span> &nbsp;·&nbsp;
         📦 Amount: <span>${rfq.amount}</span>
       </div>
       ${hedgeHtml}
@@ -756,6 +795,16 @@ function syncButtons(id) {
   info.textContent = qid ? `Active quote ID: ${qid}` : '';
 }
 
+// Deribit requires option prices to be exact multiples of the tick size.
+// Submitting a raw fair_price float (e.g. 0.052312847) causes error code 10043 (wrong_tick).
+// Both BTC and ETH vanilla options use tick size 0.0001 (denominated in their respective currency).
+// If Deribit ever changes tick sizes per instrument, replace the constant with a dynamic lookup
+// via public/get_instrument → result.tick_size.
+const OPTION_TICK_SIZE = 0.0001;
+function roundToTick(price, tick = OPTION_TICK_SIZE) {
+  return Math.round(price / tick) * tick;
+}
+
 function collectLegs(id) {
   const rfq = S.rfqCache[id];
   if (!rfq) return [];
@@ -763,7 +812,7 @@ function collectLegs(id) {
     instrument_name: l.instrument_name,
     direction:        l.direction,
     ratio:            l.ratio,
-    price:            parseFloat(document.getElementById(`lp-${id}-${i}`)?.value || 0),
+    price:            roundToTick(parseFloat(document.getElementById(`lp-${id}-${i}`)?.value || 0)),
   }));
 }
 
@@ -828,6 +877,40 @@ async function cancelQuote(id) {
       toast('Cancel failed: ' + (data.detail || resp.statusText), 'error');
     }
   } catch (e) { toast('Error: ' + e.message, 'error'); }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   TTX Countdown
+═══════════════════════════════════════════════════════════════ */
+function startCountdowns() {
+  clearInterval(S.ttxTimer);
+  tickCountdowns();
+  S.ttxTimer = setInterval(tickCountdowns, 1000);
+}
+
+function tickCountdowns() {
+  const now = Date.now();
+  for (const [id, rfq] of Object.entries(S.rfqCache)) {
+    const el = document.getElementById(`ttx-${id}`);
+    if (!el) continue;
+    const expTs = rfq.expiration_timestamp;
+    if (!expTs) { el.textContent = '—'; el.className = 'mono dim'; continue; }
+    const ms = expTs - now;
+    if (ms <= 0) {
+      el.textContent = 'Expired';
+      el.className = 'mono dim';
+    } else {
+      const s = Math.floor(ms / 1000);
+      const m = Math.floor(s / 60);
+      const h = Math.floor(m / 60);
+      el.textContent = h > 0 ? `${h}h ${m % 60}m ${s % 60}s`
+                     : m > 0 ? `${m}m ${s % 60}s`
+                     :         `${s}s`;
+      el.className = ms < 60_000  ? 'mono neg'
+                   : ms < 300_000 ? 'mono warn'
+                   :                'mono';
+    }
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════════
