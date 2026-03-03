@@ -17,11 +17,12 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 
 
-def get_mongo_connection(app: FastAPI):
+def get_mongo_connection(app: FastAPI, testnet: bool = False):
     mongo_uri = "mongodb://options:options@1.tcp.ngrok.io:25657/?authSource=admin"
     mongo_client = MongoClient(mongo_uri)
     db = mongo_client["deribit_block_rfq"]
-    mongo_collection = db["messages"]
+    collection_name = "messages_testnet" if testnet else "messages"
+    mongo_collection = db[collection_name]
     app.state.mongo_client = mongo_client
     app.state.mongo_collection = mongo_collection
 
@@ -98,14 +99,14 @@ async def lifespan(app: FastAPI):
 
     app.state.http_session = aiohttp.ClientSession()
     print("HTTP session created for Deribit API")
-    get_mongo_connection(app)
+    get_mongo_connection(app, testnet=testnet)
 
     yield
 
     # Shutdown
     await app.state.redis_client.close()
     print("Redis connection closed")
-    await app.state.mongo_client.close()
+    app.state.mongo_client.close()
     print("MongoDB connection closed")
     await app.state.http_session.close()
     print("HTTP session closed")
@@ -129,13 +130,15 @@ async def serve_ui():
 @app.get("/price/{product_name}")
 async def get_price(product_name: str, request: Request):
     """Get price for a product by native_product name"""
+    t0 = time.perf_counter()
     price_data = await request.app.state.redis_client.get(f"price:{product_name}")
-    data = {}
-    if price_data:
-        data = json.loads(price_data)
+    print(f"[Redis] GET price:{product_name} — {(time.perf_counter()-t0)*1000:.1f} ms")
+    if not price_data:
+        return {"product": product_name, "price": None, "ts": None}
+    data = json.loads(price_data)
     return {
         "product": product_name,
-        "price": data.get("strat_mid_price"),
+        "price": data.get("strat_mid_price"),  # None if field absent in Redis data
         "ts": data.get("ts"),
     }
 
@@ -143,14 +146,13 @@ async def get_price(product_name: str, request: Request):
 @app.get("/prices")
 async def get_all_prices(request: Request):
     """Get all stored prices"""
-    # Get all price keys
+    t0 = time.perf_counter()
     keys = []
     async for key in request.app.state.redis_client.scan_iter("price:*"):
         keys.append(key)
 
     prices = {}
     if keys:
-        # Batch get all values
         values = await request.app.state.redis_client.mget(keys)
         for key, value in zip(keys, values):
             if value:
@@ -160,12 +162,14 @@ async def get_all_prices(request: Request):
                     "price": data.get("strat_mid_price"),
                     "ts": data.get("ts"),
                 }
-
+    print(f"[Redis] SCAN+MGET price:* ({len(keys)} keys) — {(time.perf_counter()-t0)*1000:.1f} ms")
     return {"count": len(prices), "prices": prices}
 
 @app.get("/greeks/{product_name}")
 async def get_greeks(product_name: str, request: Request):
+    t0 = time.perf_counter()
     greeks = await request.app.state.redis_client.get(f"greeks:{product_name}")
+    print(f"[Redis] GET greeks:{product_name} — {(time.perf_counter()-t0)*1000:.1f} ms")
     data = {}
     if greeks:
         data = json.loads(greeks)
@@ -175,6 +179,7 @@ async def get_greeks(product_name: str, request: Request):
 
 @app.get("/greeks_list")
 async def get_greeks_list(request: Request):
+    t0 = time.perf_counter()
     keys = []
     async for key in request.app.state.redis_client.scan_iter("greeks:*"):
         keys.append(key)
@@ -187,13 +192,16 @@ async def get_greeks_list(request: Request):
                 product_name = key.replace("greeks:", "")
                 data = json.loads(value)
                 greeks[product_name] = data
+    print(f"[Redis] SCAN+MGET greeks:* ({len(keys)} keys) — {(time.perf_counter()-t0)*1000:.1f} ms")
     return {
         "greeks": greeks
     }
 
 @app.get("/total_greeks")
 async def get_total_greeks(request: Request):
+    t0 = time.perf_counter()
     greeks = await request.app.state.redis_client.get("total_greeks:ALL")
+    print(f"[Redis] GET total_greeks:ALL — {(time.perf_counter()-t0)*1000:.1f} ms")
     data = json.loads(greeks)
     return {
         "total_greeks": data
@@ -207,6 +215,7 @@ async def get_rfqs(request: Request):
     nanos_per_hour = 3600 * 1_000_000_000
     ten_hours_ago_ns = time.time_ns() - (10 * nanos_per_hour)
     query = {"fetch_time": {"$gte": ten_hours_ago_ns}}
+    t0 = time.perf_counter()
     cursor = mongo_collection.find(query).sort("fetch_time", -1)
     results = {}
     for doc in cursor:
@@ -218,11 +227,14 @@ async def get_rfqs(request: Request):
             data = params.get("data")
 
             # Process Block RFQ notifications
+            # Cursor is sorted fetch_time DESC so the first doc seen per rfq_id is the
+            # most recent — skip subsequent (older) docs for the same rfq_id.
             if "block_rfq.maker." in channel and "quotes" not in channel:
                 if isinstance(data, dict):
                     rfq_id = data.get("block_rfq_id")
-                    if rfq_id:
+                    if rfq_id and rfq_id not in results:
                         results[rfq_id] = data
+    print(f"[MongoDB] find /rfqs ({len(results)} RFQs) — {(time.perf_counter()-t0)*1000:.1f} ms")
     return results
 
 
@@ -279,6 +291,7 @@ async def get_rfq_status(rfq_id: str, request: Request):
         nanos_per_hour = 3600 * 1_000_000_000
         ten_hours_ago_ns = time.time_ns() - (10 * nanos_per_hour)
         query = {"fetch_time": {"$gte": ten_hours_ago_ns}}
+        t0 = time.perf_counter()
         cursor = mongo_collection.find(query).sort("fetch_time", -1)
 
         for doc in cursor:
@@ -291,6 +304,7 @@ async def get_rfq_status(rfq_id: str, request: Request):
 
                 if "block_rfq.maker." in channel and "quotes" not in channel:
                     if isinstance(data, dict) and data.get("block_rfq_id") == rfq_id:
+                        print(f"[MongoDB] find /rfqs/{rfq_id} (fallback) — {(time.perf_counter()-t0)*1000:.1f} ms")
                         return {
                             "status": "success",
                             "rfq_id": rfq_id,
@@ -299,6 +313,7 @@ async def get_rfq_status(rfq_id: str, request: Request):
                             "source": "mongodb_cache"
                         }
 
+        print(f"[MongoDB] find /rfqs/{rfq_id} (fallback, not found) — {(time.perf_counter()-t0)*1000:.1f} ms")
         raise HTTPException(
             status_code=404,
             detail=f"RFQ {rfq_id} not found"
@@ -451,6 +466,14 @@ async def add_quote(quote: QuoteRequest, request: Request):
         "price": 50000.5,
         "amount": 1.5
     }
+
+    NOTE (confirmed by Deribit tech support):
+    Calling add_block_rfq_quote multiple times on the same block_rfq_id creates additional
+    active quotes — previous quotes are NOT implicitly cancelled. Multiple simultaneous quotes
+    from the same maker are allowed, subject to per-RFQ limits (error codes:
+    too_many_quotes_per_block_rfq, too_many_quotes_per_block_rfq_side).
+    To modify an existing quote use edit_block_rfq_quote; to remove one use
+    cancel_block_rfq_quote or cancel_all_block_rfq_quotes.
     """
     session = request.app.state.http_session
 

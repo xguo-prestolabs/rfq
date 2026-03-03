@@ -161,9 +161,9 @@ with tab1:
                         product = leg["instrument_name"]
                         try:
                             price_data = api_get(f"/price/{product}").json()
-                            leg["fair_price"] = price_data.get("price") or 0
+                            leg["fair_price"] = price_data.get("price")  # None if unavailable
                         except Exception:
-                            leg["fair_price"] = 0
+                            leg["fair_price"] = None
                         try:
                             greeks_data = api_get(f"/greeks/{product}").json().get("greeks", {})
                             leg["delta"] = greeks_data.get("delta", 0)
@@ -172,19 +172,29 @@ with tab1:
                         except Exception:
                             leg["delta"] = leg["gamma"] = leg["vega"] = 0
 
-                    # Combo row (signed by direction)
+                    # Combo row (signed by direction); fair_price is None if any leg price is missing
                     combo = {"instrument_name": rfq.get("combo_id", "COMBO"), "direction": "—",
-                             "ratio": "—", "delta": 0.0, "gamma": 0.0, "vega": 0.0, "fair_price": 0.0}
+                             "ratio": "—", "delta": 0.0, "gamma": 0.0, "vega": 0.0, "fair_price": None}
+                    combo_price = 0.0
+                    all_prices_available = True
                     for leg in legs:
                         sign = 1 if leg["direction"] == "buy" else -1
                         ratio = leg["ratio"] * sign
                         combo["delta"] += leg["delta"] * ratio
                         combo["gamma"] += leg["gamma"] * ratio
                         combo["vega"] += leg["vega"] * ratio
-                        combo["fair_price"] += leg["fair_price"] * ratio
+                        if leg["fair_price"] is None:
+                            all_prices_available = False
+                        else:
+                            combo_price += leg["fair_price"] * ratio
+                    combo["fair_price"] = combo_price if all_prices_available else None
 
                     df_legs = pd.DataFrame(legs + [combo])
-                    st.dataframe(df_legs, use_container_width=True, hide_index=True)
+                    df_display = df_legs.copy()
+                    df_display["fair_price"] = df_display["fair_price"].apply(
+                        lambda x: "N/A" if pd.isna(x) else x
+                    )
+                    st.dataframe(df_display, use_container_width=True, hide_index=True)
 
                     # Hedge info
                     hedge = rfq.get("hedge")
@@ -213,7 +223,8 @@ with tab1:
                         st.session_state[sk_direction] = "sell" if first_leg_dir == "buy" else "buy"
                     for i, sk in enumerate(sk_leg_prices):
                         if sk not in st.session_state:
-                            st.session_state[sk] = float(legs[i].get("fair_price", 0.0))
+                            fp = legs[i].get("fair_price")
+                            st.session_state[sk] = float(fp) if fp is not None else 0.0
 
                     # Inputs
                     direction = st.selectbox(

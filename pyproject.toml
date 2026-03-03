@@ -3,7 +3,7 @@ name = "coin"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.6.3"
+requires-python = ">=3.10"
 dependencies = [
     "absl-py>=1.4.0",
     "aiohttp>=3.8.6",
@@ -14,6 +14,7 @@ dependencies = [
     "pyzmq>=25.1.2",
     "redis>=4.3.6",
     "streamlit>=1.10.0",
+    "uvicorn>=0.20.0",
     "websockets>=9.1",
 ]
 

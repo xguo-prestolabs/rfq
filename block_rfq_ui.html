@@ -387,11 +387,6 @@ tbody td { padding: 6px 10px; vertical-align: middle; }
     </div>
     <button class="btn btn-danger btn-block" onclick="cancelAll()">Cancel All Quotes</button>
 
-    <hr>
-
-    <div class="section-title">📊 Total Greeks</div>
-    <div id="greeks"><div class="loading"><span class="spin"></span></div></div>
-
   </aside>
 
   <!-- ═══════════ MAIN ═══════════ -->
@@ -439,7 +434,7 @@ tbody td { padding: 6px 10px; vertical-align: middle; }
 /* ═══════════════════════════════════════════════════════════════
    Constants & state
 ═══════════════════════════════════════════════════════════════ */
-const BASE = 'http://127.0.0.1:8000';
+const BASE = '';
 
 const S = {
   tab:      'rfqs',
@@ -539,7 +534,7 @@ async function configure() {
     if (resp.ok) {
       el.innerHTML = '<span class="badge badge-ok">✅ Connected</span>';
       toast(data.message || 'Configured', 'success');
-      refresh(); loadGreeks();
+      refresh();
     } else {
       el.innerHTML = '<span class="badge badge-err">❌ Failed</span>';
       toast('Configure failed: ' + (data.detail || resp.statusText), 'error');
@@ -569,33 +564,6 @@ async function cancelAll() {
   } catch (e) { toast('Error: ' + e.message, 'error'); }
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   Total Greeks (sidebar)
-═══════════════════════════════════════════════════════════════ */
-async function loadGreeks() {
-  const el = document.getElementById('greeks');
-  try {
-    const resp = await GET('/total_greeks');
-    if (!resp.ok) { el.innerHTML = '<p class="dim" style="font-size:12px">Unavailable</p>'; return; }
-    const data = await resp.json();
-    const g    = data.total_greeks || {};
-    const skip = new Set(['ts', 'trade_key', 'msg_type', 'native_product']);
-    const rows = Object.entries(g)
-      .filter(([k]) => !skip.has(k))
-      .map(([k, v]) => {
-        const n  = parseFloat(v);
-        const cls = isNaN(n) ? '' : (n >= 0 ? 'pos' : 'neg');
-        const txt = isNaN(n) ? esc(String(v)) : n.toFixed(4);
-        return `<tr>
-          <td style="font-size:11px;color:var(--muted);padding:3px 6px">${esc(k)}</td>
-          <td class="mono ${cls}" style="text-align:right;font-size:12px;padding:3px 6px">${txt}</td>
-        </tr>`;
-      }).join('');
-    el.innerHTML = rows
-      ? `<div class="tbl-wrap"><table><tbody>${rows}</tbody></table></div>`
-      : '<p class="dim" style="font-size:12px">No data</p>';
-  } catch { el.innerHTML = '<p class="dim" style="font-size:12px">Unavailable</p>'; }
-}
 
 /* ═══════════════════════════════════════════════════════════════
    RFQs Tab
@@ -949,7 +917,6 @@ function esc(s) {
    Init
 ═══════════════════════════════════════════════════════════════ */
 (function init() {
-  loadGreeks();
   loadRFQs();
 })();
 </script>

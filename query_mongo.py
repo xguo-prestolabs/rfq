@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Query recent MongoDB documents from ws_client config. Debug/dev only."""
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -9,12 +10,19 @@ from pymongo import MongoClient
 
 
 def main() -> None:
-    config_path = Path("config/ws_client_config_mongodb.json")
-    if len(sys.argv) > 1:
-        config_path = Path(sys.argv[1])
-    limit = 20
-    if len(sys.argv) > 2:
-        limit = int(sys.argv[2])
+    parser = argparse.ArgumentParser(description="Query recent MongoDB documents.")
+    parser.add_argument("--testnet", action="store_true", help="Use testnet config")
+    parser.add_argument("config", nargs="?", help="Path to config JSON")
+    parser.add_argument("limit", nargs="?", type=int, default=20, help="Max documents")
+    args = parser.parse_args()
+
+    if args.config:
+        config_path = Path(args.config)
+    elif args.testnet:
+        config_path = Path("config/ws_client_config_testnet_mongodb.json")
+    else:
+        config_path = Path("config/ws_client_config_mongodb.json")
+    limit = args.limit
 
     with open(config_path) as f:
         config = json.load(f)
