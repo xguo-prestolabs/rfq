@@ -1,11 +1,15 @@
+import argparse
 import json
+import os
 import time
 import redis.asyncio as redis
 import aiohttp
 import uuid
+import uvicorn
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 from pymongo import MongoClient
 from bson import json_util
@@ -63,6 +67,29 @@ deribit_config = DeribitConfig()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Load Deribit credentials at startup (env vars take priority over config file)
+    client_id = os.environ.get("DERIBIT_CLIENT_ID")
+    client_secret = os.environ.get("DERIBIT_CLIENT_SECRET")
+    testnet = os.environ.get("DERIBIT_TESTNET") == "1"
+
+    config_path = os.environ.get("DERIBIT_CONFIG")
+    if config_path:
+        with open(config_path) as f:
+            cfg = json.load(f)
+        client_id = client_id or cfg.get("client_id")
+        client_secret = client_secret or cfg.get("client_secret")
+        testnet = testnet or cfg.get("testnet", False)
+        print(f"Loaded Deribit config from {config_path}")
+
+    if client_id and client_secret:
+        deribit_config.client_id = client_id
+        deribit_config.client_secret = client_secret
+        deribit_config.base_url = (
+            "https://test.deribit.com/api/v2" if testnet
+            else "https://www.deribit.com/api/v2"
+        )
+        print(f"Deribit credentials configured at startup (testnet={testnet})")
+
     # Startup: Connect to Redis (ZMQ is handled by zmq_to_redis.py)
     app.state.redis_client = await redis.from_url(
         "redis://localhost:6379", decode_responses=True
@@ -92,6 +119,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/")
+async def serve_ui():
+    return FileResponse("block_rfq_ui.html")
 
 
 @app.get("/price/{product_name}")
@@ -359,14 +391,16 @@ async def call_deribit_api(
 
     url = f"{deribit_config.base_url}/private/{method.replace('private/', '')}"
 
+    print(f"Deribit API call: {method} params={json.dumps(params)}")
     async with session.post(url, json=payload, headers=headers) as response:
         result = await response.json()
 
         if "error" in result:
             error = result["error"]
+            print(f"Deribit API error response: {json.dumps(result)}")
             raise HTTPException(
                 status_code=400,
-                detail=f"Deribit API error: {error.get('message', error)}"
+                detail=f"Deribit API error: {error.get('message', error)} (code={error.get('code')}, data={error.get('data')})"
             )
 
         return result.get("result", {})
@@ -675,3 +709,18 @@ async def get_quote_by_id(quote_id: str, request: Request):
             status_code=500,
             detail=f"Failed to get quote: {str(e)}"
         )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="RFQ market-maker API")
+    parser.add_argument("--config", default=None, help="Path to JSON config with client_id/client_secret")
+    parser.add_argument("--testnet", action="store_true", help="Use Deribit testnet instead of mainnet")
+    parser.add_argument("--port", type=int, default=8000)
+    args = parser.parse_args()
+
+    if args.config:
+        os.environ["DERIBIT_CONFIG"] = args.config
+    if args.testnet:
+        os.environ["DERIBIT_TESTNET"] = "1"
+
+    uvicorn.run("app:app", host="0.0.0.0", port=args.port, reload=True)
