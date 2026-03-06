@@ -457,6 +457,7 @@ class DeribitRfqClient:
 
           block_rfq.maker.quotes.*  →  rfq_quote:<block_rfq_quote_id>
           block_rfq.maker.*         →  rfq:<block_rfq_id>
+          block_rfq.taker.*         →  rfq:<block_rfq_id>
           block_rfq.trades.*        →  rfq_trade:<block_rfq_id>
         """
         if self._redis is None:
@@ -476,12 +477,12 @@ class DeribitRfqClient:
                     await self._redis.publish("rfq_updates", json.dumps({"type": "rfq_quote", "id": qid}))
                     log.info(f"[Redis] rfq_quote:{qid}")
 
-            elif "block_rfq.maker." in channel:
+            elif "block_rfq.maker." in channel or "block_rfq.taker." in channel:
                 rfq_id = data.get("block_rfq_id")
                 if rfq_id:
                     await self._redis.set(f"rfq:{rfq_id}", json.dumps(data))
                     await self._redis.publish("rfq_updates", json.dumps({"type": "rfq", "id": rfq_id, "data": data}))
-                    log.info(f"[Redis] rfq:{rfq_id}  state={data.get('state')}")
+                    log.info(f"[Redis] rfq:{rfq_id}  channel={channel}  state={data.get('state')}")
 
             elif "block_rfq.trades." in channel:
                 rfq_id = data.get("block_rfq_id")
