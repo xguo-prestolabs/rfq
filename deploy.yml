@@ -1,0 +1,16 @@
+- name: Deploy RFQ files to production
+  hosts: prod
+  vars:
+    remote_dir: ~/workspace/basis_strat2/20200407/wps_py
+  tasks:
+    - name: Copy application and config files
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ remote_dir }}/{{ item | basename }}"
+      loop:
+        - app.py
+        - ws_client_redis.py
+        - zmq_to_redis.py
+        - config/ws_client_config_testnet_mongodb.json
+        - config/ws_client_config_mongodb_redis.json
+        - config/ws_client_config_testnet_mongodb_redis.json

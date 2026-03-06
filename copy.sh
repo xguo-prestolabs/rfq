@@ -10,7 +10,6 @@ upload() {
 }
 
 upload app.py
-upload ws_client.py
 upload ws_client_redis.py
 upload zmq_to_redis.py
 upload config/ws_client_config_testnet_mongodb.json
