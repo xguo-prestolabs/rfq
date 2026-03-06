@@ -1,4 +1,6 @@
 import argparse
+import asyncio
+from collections import defaultdict, deque
 import json
 import os
 import time
@@ -7,7 +9,7 @@ import aiohttp
 import uuid
 import uvicorn
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
@@ -62,8 +64,84 @@ class DeribitConfig:
         self.refresh_token: Optional[str] = None
         self.token_expiry: Optional[int] = None
         self.base_url = "https://www.deribit.com/api/v2"  # Change to test.deribit.com for testnet
+        self.testnet: bool = False
 
 deribit_config = DeribitConfig()
+
+# ── WebSocket clients for live updates ───────────────────────────────────────
+_ws_clients: set = set()
+_pubsub_connected: bool = False   # True while broadcaster is subscribed to rfq_updates
+_pubsub_last_msg_at: Optional[float] = None  # time.time() of last received pub/sub message
+
+# ── Query timing stats ────────────────────────────────────────────────────────
+class _OpStats:
+    __slots__ = ("count", "total_ms", "min_ms", "max_ms", "recent")
+    def __init__(self):
+        self.count    = 0
+        self.total_ms = 0.0
+        self.min_ms   = float("inf")
+        self.max_ms   = 0.0
+        self.recent: deque = deque(maxlen=20)
+
+    def record(self, ms: float):
+        self.count    += 1
+        self.total_ms += ms
+        if ms < self.min_ms: self.min_ms = ms
+        if ms > self.max_ms: self.max_ms = ms
+        self.recent.append(round(ms, 1))
+
+    @property
+    def avg_ms(self) -> float:
+        return self.total_ms / self.count if self.count else 0.0
+
+_stats: dict = defaultdict(_OpStats)
+
+
+async def _pubsub_broadcaster(redis_url: str):
+    """Subscribe to Redis rfq_updates and fan-out messages to all browser WebSocket clients.
+    Reconnects automatically if the Redis connection drops (e.g. SSH tunnel flap)."""
+    global _pubsub_connected, _pubsub_last_msg_at, _ws_clients
+    delay = 1
+    while True:
+        pubsub_conn = None
+        try:
+            pubsub_conn = await redis.from_url(redis_url, decode_responses=True)
+            pubsub = pubsub_conn.pubsub()
+            await pubsub.subscribe("rfq_updates")
+            _pubsub_connected = True
+            print("Pub/sub broadcaster subscribed to rfq_updates")
+            delay = 1  # reset backoff after successful connect
+            async for message in pubsub.listen():
+                if message["type"] != "message":
+                    continue
+                payload = message["data"]
+                _pubsub_last_msg_at = time.time()
+                try:
+                    meta = json.loads(payload)
+                    print(f"[pubsub] rfq_updates → type={meta.get('type')} id={meta.get('id')} state={meta.get('data', {}).get('state', '—')} clients={len(_ws_clients)}")
+                except Exception:
+                    print(f"[pubsub] rfq_updates → (unparseable) clients={len(_ws_clients)}")
+                dead = set()
+                for ws in list(_ws_clients):
+                    try:
+                        await ws.send_text(payload)
+                    except Exception:
+                        dead.add(ws)
+                _ws_clients -= dead
+        except asyncio.CancelledError:
+            _pubsub_connected = False
+            return
+        except Exception as e:
+            _pubsub_connected = False
+            print(f"[pubsub] connection lost: {e} — reconnecting in {delay}s")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30)
+        finally:
+            if pubsub_conn:
+                try:
+                    await pubsub_conn.aclose()
+                except Exception:
+                    pass
 
 
 @asynccontextmanager
@@ -89,6 +167,7 @@ async def lifespan(app: FastAPI):
             "https://test.deribit.com/api/v2" if testnet
             else "https://www.deribit.com/api/v2"
         )
+        deribit_config.testnet = testnet
         print(f"Deribit credentials configured at startup (testnet={testnet})")
 
     # Startup: Connect to Redis (ZMQ is handled by zmq_to_redis.py)
@@ -101,9 +180,20 @@ async def lifespan(app: FastAPI):
     print("HTTP session created for Deribit API")
     get_mongo_connection(app, testnet=testnet)
 
+    app.state.broadcaster = asyncio.create_task(
+        _pubsub_broadcaster("redis://localhost:6379")
+    )
+    print("Redis pub/sub broadcaster started")
+
     yield
 
     # Shutdown
+    app.state.broadcaster.cancel()
+    try:
+        await app.state.broadcaster
+    except asyncio.CancelledError:
+        pass
+    print("Broadcaster stopped")
     await app.state.redis_client.close()
     print("Redis connection closed")
     app.state.mongo_client.close()
@@ -127,12 +217,44 @@ async def serve_ui():
     return FileResponse("block_rfq_ui.html")
 
 
+@app.get("/health")
+async def health(request: Request):
+    """Liveness check: Redis ping + pub/sub broadcaster status."""
+    try:
+        await request.app.state.redis_client.ping()
+        redis_ok = True
+    except Exception:
+        redis_ok = False
+    last_msg_age = round(time.time() - _pubsub_last_msg_at) if _pubsub_last_msg_at else None
+    return {
+        "redis": "ok" if redis_ok else "error",
+        "pubsub": "ok" if _pubsub_connected else "error",
+        "pubsub_last_msg_ago_s": last_msg_age,
+        "ws_clients": len(_ws_clients),
+        "testnet": deribit_config.testnet,
+    }
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time RFQ push updates (Redis pub/sub fan-out)."""
+    await websocket.accept()
+    _ws_clients.add(websocket)
+    try:
+        while True:
+            await websocket.receive_text()  # keep connection alive; ignore client messages
+    except WebSocketDisconnect:
+        pass
+    finally:
+        _ws_clients.discard(websocket)
+
+
 @app.get("/price/{product_name}")
 async def get_price(product_name: str, request: Request):
     """Get price for a product by native_product name"""
     t0 = time.perf_counter()
     price_data = await request.app.state.redis_client.get(f"price:{product_name}")
-    print(f"[Redis] GET price:{product_name} — {(time.perf_counter()-t0)*1000:.1f} ms")
+    _stats["GET /price/{product}"].record((time.perf_counter() - t0) * 1000)
     if not price_data:
         return {"product": product_name, "price": None, "ts": None}
     data = json.loads(price_data)
@@ -162,14 +284,14 @@ async def get_all_prices(request: Request):
                     "price": data.get("strat_mid_price"),
                     "ts": data.get("ts"),
                 }
-    print(f"[Redis] SCAN+MGET price:* ({len(keys)} keys) — {(time.perf_counter()-t0)*1000:.1f} ms")
+    _stats["GET /prices (SCAN+MGET)"].record((time.perf_counter() - t0) * 1000)
     return {"count": len(prices), "prices": prices}
 
 @app.get("/greeks/{product_name}")
 async def get_greeks(product_name: str, request: Request):
     t0 = time.perf_counter()
     greeks = await request.app.state.redis_client.get(f"greeks:{product_name}")
-    print(f"[Redis] GET greeks:{product_name} — {(time.perf_counter()-t0)*1000:.1f} ms")
+    _stats["GET /greeks/{product}"].record((time.perf_counter() - t0) * 1000)
     data = {}
     if greeks:
         data = json.loads(greeks)
@@ -192,7 +314,7 @@ async def get_greeks_list(request: Request):
                 product_name = key.replace("greeks:", "")
                 data = json.loads(value)
                 greeks[product_name] = data
-    print(f"[Redis] SCAN+MGET greeks:* ({len(keys)} keys) — {(time.perf_counter()-t0)*1000:.1f} ms")
+    _stats["GET /greeks_list (SCAN+MGET)"].record((time.perf_counter() - t0) * 1000)
     return {
         "greeks": greeks
     }
@@ -201,16 +323,61 @@ async def get_greeks_list(request: Request):
 async def get_total_greeks(request: Request):
     t0 = time.perf_counter()
     greeks = await request.app.state.redis_client.get("total_greeks:ALL")
-    print(f"[Redis] GET total_greeks:ALL — {(time.perf_counter()-t0)*1000:.1f} ms")
+    _stats["GET /total_greeks"].record((time.perf_counter() - t0) * 1000)
     data = json.loads(greeks)
     return {
         "total_greeks": data
     }
 
+@app.get("/trades")
+async def get_trades(request: Request):
+    """Get recent RFQ trades from Redis (rfq_trade:* keys), sorted newest first."""
+    t0 = time.perf_counter()
+    keys = await request.app.state.redis_client.keys("rfq_trade:*")
+    trades = []
+    if keys:
+        values = await request.app.state.redis_client.mget(*keys)
+        for v in values:
+            if v:
+                try:
+                    trades.append(json.loads(v))
+                except Exception:
+                    pass
+    trades.sort(key=lambda t: t.get("timestamp", 0), reverse=True)
+    _stats["GET /trades"].record((time.perf_counter() - t0) * 1000)
+    return {"trades": trades[:20]}
+
+
 @app.get("/rfqs")
 async def get_rfqs(request: Request):
-    """Get all RFQs"""
-    # Get all RFQ keys
+    """Get all RFQs from Redis (rfq:* keys)."""
+    t0 = time.perf_counter()
+    # KEYS is a single round-trip; safe here because rfq:* is a bounded set (~hundreds of keys).
+    # scan_iter was previously used but caused excessive round-trips over the SSH tunnel (~7 RTTs
+    # for 610 keys at the default batch size of 100), making this endpoint very slow.
+    keys = await request.app.state.redis_client.keys("rfq:*")
+    t1 = time.perf_counter()
+    results = {}
+    if keys:
+        values = await request.app.state.redis_client.mget(keys)
+        t2 = time.perf_counter()
+        for key, value in zip(keys, values):
+            if value:
+                rfq_id = int(key.split(":", 1)[1])
+                results[rfq_id] = json.loads(value)
+    else:
+        t2 = time.perf_counter()
+    keys_ms, mget_ms = (t1-t0)*1000, (t2-t1)*1000
+    _stats["GET /rfqs — KEYS rfq:*"].record(keys_ms)
+    _stats["GET /rfqs — MGET"].record(mget_ms)
+    _stats["GET /rfqs — total"].record(keys_ms + mget_ms)
+    print(f"[Redis] KEYS rfq:* ({len(keys)} keys) — {keys_ms:.1f} ms | MGET — {mget_ms:.1f} ms | total — {keys_ms+mget_ms:.1f} ms")
+    return results
+
+
+@app.get("/rfqs/mongodb")
+async def get_rfqs_from_mongodb(request: Request):
+    """Get all RFQs from MongoDB (last 10 hours), newest state per RFQ."""
     mongo_collection = request.app.state.mongo_collection
     nanos_per_hour = 3600 * 1_000_000_000
     ten_hours_ago_ns = time.time_ns() - (10 * nanos_per_hour)
@@ -226,7 +393,6 @@ async def get_rfqs(request: Request):
             channel = params.get("channel", "")
             data = params.get("data")
 
-            # Process Block RFQ notifications
             # Cursor is sorted fetch_time DESC so the first doc seen per rfq_id is the
             # most recent — skip subsequent (older) docs for the same rfq_id.
             if "block_rfq.maker." in channel and "quotes" not in channel:
@@ -234,8 +400,69 @@ async def get_rfqs(request: Request):
                     rfq_id = data.get("block_rfq_id")
                     if rfq_id and rfq_id not in results:
                         results[rfq_id] = data
-    print(f"[MongoDB] find /rfqs ({len(results)} RFQs) — {(time.perf_counter()-t0)*1000:.1f} ms")
+    _stats["GET /rfqs/mongodb"].record((time.perf_counter() - t0) * 1000)
+    print(f"[MongoDB] find /rfqs/mongodb ({len(results)} RFQs) — {(time.perf_counter()-t0)*1000:.1f} ms")
     return results
+
+
+@app.get("/stats")
+async def stats_page():
+    """HTML dashboard showing per-endpoint query timing stats."""
+    from fastapi.responses import HTMLResponse
+
+    def row(name: str, s: _OpStats) -> str:
+        recent = ", ".join(f"{v}" for v in s.recent)
+        return (
+            f"<tr>"
+            f"<td>{name}</td>"
+            f"<td>{s.count}</td>"
+            f"<td>{s.avg_ms:.1f}</td>"
+            f"<td>{s.min_ms:.1f}</td>"
+            f"<td>{s.max_ms:.1f}</td>"
+            f"<td class='recent'>{recent}</td>"
+            f"</tr>"
+        )
+
+    rows = "".join(row(k, v) for k, v in sorted(_stats.items()))
+    ws_count = len(_ws_clients)
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="refresh" content="5">
+<title>RFQ Stats</title>
+<style>
+  body {{ background:#0d1117; color:#e6edf3; font-family:monospace; padding:24px; }}
+  h1   {{ font-size:18px; margin-bottom:4px; }}
+  p    {{ color:#8b949e; font-size:12px; margin-bottom:16px; }}
+  table {{ border-collapse:collapse; width:100%; font-size:13px; }}
+  th   {{ background:#21262d; color:#8b949e; text-align:left; padding:6px 12px;
+           font-size:11px; text-transform:uppercase; letter-spacing:.05em;
+           border-bottom:1px solid #30363d; }}
+  td   {{ padding:6px 12px; border-bottom:1px solid #21262d; }}
+  tr:hover td {{ background:#161b22; }}
+  .recent {{ color:#8b949e; font-size:11px; max-width:340px;
+              overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+  .badge {{ display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px;
+             background:rgba(63,185,80,.15); color:#3fb950; }}
+</style>
+</head>
+<body>
+<h1>RFQ API — Query Stats</h1>
+<p>Auto-refreshes every 5 s &nbsp;·&nbsp;
+   <span class="badge">⬤ {ws_count} browser WS client{'s' if ws_count != 1 else ''}</span></p>
+<table>
+  <thead>
+    <tr>
+      <th>Operation</th><th>Count</th><th>Avg (ms)</th>
+      <th>Min (ms)</th><th>Max (ms)</th><th>Last 20 samples (ms)</th>
+    </tr>
+  </thead>
+  <tbody>{rows if rows else '<tr><td colspan="6" style="color:#8b949e">No data yet — make some requests.</td></tr>'}</tbody>
+</table>
+</body>
+</html>"""
+    return HTMLResponse(html)
 
 
 @app.get("/rfqs/{rfq_id}")
@@ -337,7 +564,7 @@ async def ensure_authenticated(session: aiohttp.ClientSession) -> bool:
     if not deribit_config.client_id or not deribit_config.client_secret:
         raise HTTPException(
             status_code=401,
-            detail="Deribit credentials not configured. Use /configure endpoint first."
+            detail="Deribit credentials not configured. Start app with --config <path> or set DERIBIT_CONFIG env var."
         )
 
     # Check if token is still valid
@@ -419,36 +646,6 @@ async def call_deribit_api(
             )
 
         return result.get("result", {})
-
-
-# ============================================================================
-# Configuration Endpoint
-# ============================================================================
-
-@app.post("/configure")
-async def configure_deribit(
-    client_id: str,
-    client_secret: str,
-    testnet: bool = True
-):
-    """Configure Deribit API credentials"""
-    deribit_config.client_id = client_id
-    deribit_config.client_secret = client_secret
-    deribit_config.base_url = (
-        "https://test.deribit.com/api/v2" if testnet
-        else "https://www.deribit.com/api/v2"
-    )
-
-    # Clear existing tokens
-    deribit_config.access_token = None
-    deribit_config.refresh_token = None
-    deribit_config.token_expiry = None
-
-    return {
-        "status": "configured",
-        "testnet": testnet,
-        "message": "Deribit credentials configured successfully"
-    }
 
 
 # ============================================================================
@@ -739,6 +936,10 @@ if __name__ == "__main__":
     parser.add_argument("--config", default=None, help="Path to JSON config with client_id/client_secret")
     parser.add_argument("--testnet", action="store_true", help="Use Deribit testnet instead of mainnet")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--root-path", default="",
+        help="ASGI root_path when served under an nginx subpath, e.g. /rfq"
+    )
     args = parser.parse_args()
 
     if args.config:
@@ -746,4 +947,13 @@ if __name__ == "__main__":
     if args.testnet:
         os.environ["DERIBIT_TESTNET"] = "1"
 
-    uvicorn.run("app:app", host="0.0.0.0", port=args.port, reload=True)
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0",
+        port=args.port,
+        root_path=args.root_path,
+        # Trust X-Forwarded-For / X-Forwarded-Proto from nginx
+        proxy_headers=True,
+        forwarded_allow_ips="*",
+        reload=True,
+    )

@@ -1,0 +1,35 @@
+{
+  "server": "wss://test.deribit.com/ws/api/v2",
+  "client_type": "deribit",
+  "ping_interval": 60,
+  "trade_key": {
+    "access_key": "ro8V9wor",
+    "secret_key": "A4uRTlsRognIyeLQID4LDEKFPRSGibb8IQz0Uos_aOU"
+  },
+  "scope": "session:cpp_og",
+  "subscription": {
+    "method": "public/subscribe",
+    "params": {
+      "channels": [
+        "block_rfq.maker.BTC",
+        "block_rfq.taker.BTC",
+        "block_rfq.trades.BTC",
+        "block_rfq.maker.quotes.BTC",
+        "block_rfq.maker.ETH",
+        "block_rfq.taker.ETH",
+        "block_rfq.trades.ETH",
+        "block_rfq.maker.quotes.ETH"
+      ]
+    }
+  },
+  "mongodb": {
+    "enabled": true,
+    "uri": "mongodb://options:options@1.tcp.ngrok.io:25657/?authSource=admin",
+    "database": "deribit_block_rfq",
+    "collection": "messages_testnet"
+  },
+  "redis": {
+    "enabled": true,
+    "url": "redis://localhost:6379"
+  }
+}

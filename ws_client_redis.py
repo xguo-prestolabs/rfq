@@ -6,7 +6,23 @@ Subscribes to Deribit block_rfq channels and writes every subscription message t
   - Redis      (if redis.enabled in config)
   - Local file (if local_file.enabled in config)
 
-Reconnects automatically on any error or disconnection.
+Robustness features
+-------------------
+  - Exponential backoff on reconnect (RECONNECT_BASE → RECONNECT_CAP seconds),
+    reset to base after a stable connection (>= STABLE_THRESHOLD seconds).
+  - Watchdog task: declares the connection dead if no frame is received from the
+    server for WATCHDOG_TIMEOUT seconds.  Catches silent TCP drops that the
+    websockets library would otherwise not detect.
+  - Deribit heartbeat protocol: calls public/set_heartbeat after subscribing so
+    Deribit sends periodic test_request probes; the message loop responds with
+    public/test immediately.  Without this Deribit closes the connection after
+    ~60 s of silence.
+  - Keepalive task: independently verifies auth every KEEPALIVE_INTERVAL seconds
+    as a belt-and-suspenders check on top of the heartbeat protocol.
+  - Both keepalive and watchdog run concurrently with the message loop; any task
+    failing (or completing) immediately cancels the others and triggers reconnect.
+  - Connection-setup timeout: the TCP connect + login + subscribe sequence must
+    finish within SETUP_TIMEOUT seconds, preventing hangs on a bad network.
 
 Redis key layout
 ----------------
@@ -14,19 +30,17 @@ Redis key layout
   rfq_trade:<block_rfq_id>  block_rfq.trades.* — latest trade for that RFQ
   rfq_quote:<quote_id>      block_rfq.maker.quotes.* — latest quote snapshot
 
-All Redis values are JSON strings of the params.data field.
-The most-recent message always overwrites the previous one (SET, not a list).
+All Redis values are JSON strings of params.data.  Most-recent message wins (SET).
 
 Config format
 -------------
 {
   "server":       "wss://www.deribit.com/ws/api/v2",
-  "ping_interval": 60,
   "scope":        "session:cpp_og",
-  "trade_key":    "trade_key.json"   // path string OR inline {"access_key":..,"secret_key":..}
+  "trade_key":    "trade_key.json",   // file path OR inline {"access_key":..,"secret_key":..}
   "subscription": {
     "method": "public/subscribe",
-    "params": { "channels": [ "block_rfq.maker.BTC", ... ] }
+    "params": { "channels": ["block_rfq.maker.BTC", ...] }
   },
   "mongodb": {
     "enabled":    true,
@@ -40,7 +54,7 @@ Config format
   },
   "local_file": {
     "enabled": true,
-    "path":    "rfq_messages.jsonl"   // optional; auto-generated name if omitted
+    "path":    "rfq_messages.jsonl"   // optional; auto-named if omitted
   }
 }
 
@@ -75,7 +89,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _expand_trade_key(config: dict) -> dict:
-    """Recursively expand trade_key path strings to dicts."""
+    """Recursively expand trade_key path strings to inline dicts."""
     result = config.copy()
     for k, v in config.items():
         if k == "trade_key" and isinstance(v, str):
@@ -98,11 +112,10 @@ class FileWriter:
     def __init__(self, path: Optional[str] = None):
         self._path = path or f"rfq_messages_{time.time_ns()}.jsonl"
         self._fp = open(self._path, "a", encoding="utf-8")
-        log.info(f"Local file writer opened: {self._path}")
+        log.info(f"Local file writer: {self._path}")
 
     def write(self, doc: dict):
-        self._fp.write(json.dumps(doc, default=str))
-        self._fp.write("\n")
+        self._fp.write(json.dumps(doc, default=str) + "\n")
         self._fp.flush()
 
     def close(self):
@@ -110,30 +123,38 @@ class FileWriter:
 
 
 # ---------------------------------------------------------------------------
+# Sentinel exception for the watchdog
+# ---------------------------------------------------------------------------
+
+class WatchdogTimeout(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
 
 class DeribitRfqClient:
-    """
-    Standalone Deribit Block RFQ WebSocket client.
-
-    Authentication flow (per connection):
-      1. public/auth  (client_credentials)
-      2. private/get_account_summary  (verify auth)
-      3. public/subscribe  (block_rfq channels)
-      4. periodic keepalive via private/get_account_summary
-
-    Each subscription message is written to MongoDB, Redis, and/or a local file
-    depending on which sinks are enabled in the config.
-    """
+    # ── Tunable constants ────────────────────────────────────────────────────
+    SETUP_TIMEOUT      = 30   # seconds: TCP connect + login + subscribe must finish
+    REQUEST_TIMEOUT    = 10   # seconds: per JSON-RPC request
+    WATCHDOG_TIMEOUT   = 90   # seconds: silence from server → dead connection
+    HEARTBEAT_INTERVAL = 30   # seconds: ask Deribit to probe us at this rate
+    KEEPALIVE_INTERVAL = 120  # seconds: independent auth-check period
+    RECONNECT_BASE     = 2    # seconds: initial reconnect wait
+    RECONNECT_CAP      = 60   # seconds: maximum reconnect wait
+    STABLE_THRESHOLD   = 60   # seconds: uptime needed to reset backoff to base
+    # ─────────────────────────────────────────────────────────────────────────
 
     def __init__(self, config: dict):
         self.config = config
-        self._request_counter = 0
-        self._id_prefix = f"rfq_{id(self)}"
+        self._req_counter = 0
+        self._id_prefix   = f"rfq_{id(self)}"
         self._pending: Dict[str, asyncio.Future] = {}
+        self._last_msg_at: float = 0.0   # monotonic timestamp of last received frame
 
-        # MongoDB (sync client — pymongo)
+        # MongoDB (sync pymongo — blocking calls are acceptable here because they
+        # run in the message loop which has no other concurrent awaits at that point)
         self._mongo_col = None
         mongo_cfg = config.get("mongodb", {})
         if mongo_cfg.get("enabled"):
@@ -142,10 +163,13 @@ class DeribitRfqClient:
             self._mongo_col = db[mongo_cfg.get("collection", "messages")]
             log.info(f"MongoDB connected: {mongo_cfg['uri']}")
 
-        # Redis (async — initialised per connection inside _connect)
+        # Redis — async client, created fresh each session inside _connect()
         self._redis: Optional[aioredis.Redis] = None
         redis_cfg = config.get("redis", {})
-        self._redis_url = redis_cfg.get("url", "redis://localhost:6379") if redis_cfg.get("enabled") else None
+        self._redis_url = (
+            redis_cfg.get("url", "redis://localhost:6379")
+            if redis_cfg.get("enabled") else None
+        )
 
         # Local file
         self._file: Optional[FileWriter] = None
@@ -153,149 +177,239 @@ class DeribitRfqClient:
         if file_cfg.get("enabled"):
             self._file = FileWriter(file_cfg.get("path"))
 
-    # ------------------------------------------------------------------
-    # Public entry point
-    # ------------------------------------------------------------------
+    # ── Public entry point ───────────────────────────────────────────────────
 
     async def run(self):
-        """Connect and receive messages, reconnecting forever on any error."""
+        """
+        Connect → receive → reconnect, forever.
+
+        Backoff doubles from RECONNECT_BASE up to RECONNECT_CAP on each
+        consecutive failure.  Resets to RECONNECT_BASE after the connection
+        was stable for at least STABLE_THRESHOLD seconds.
+        """
+        delay   = self.RECONNECT_BASE
+        attempt = 0
+
         while True:
+            attempt += 1
+            t_start = time.monotonic()
+            log.info(f"--- Connection attempt #{attempt} ---")
+
             try:
                 await self._connect()
-                log.info("Connection closed gracefully — stopping.")
-                break
+                # _connect() only returns normally if the WebSocket closed without
+                # raising — still treat it as a disconnect and reconnect.
+                log.info("Connection ended — reconnecting")
+            except asyncio.CancelledError:
+                log.info("Cancelled — shutting down")
+                return
             except Exception as e:
-                log.error(f"Connection error: {e}")
-                log.info("Reconnecting in 5 seconds…")
-                await asyncio.sleep(5)
+                log.error(f"Connection lost: {type(e).__name__}: {e}")
 
-    # ------------------------------------------------------------------
-    # Connection lifecycle
-    # ------------------------------------------------------------------
+            # Reset backoff if this session was stable long enough
+            elapsed = time.monotonic() - t_start
+            if elapsed >= self.STABLE_THRESHOLD:
+                log.info(f"Session was stable for {elapsed:.0f}s — resetting backoff")
+                delay = self.RECONNECT_BASE
+
+            log.info(f"Reconnecting in {delay}s (next: attempt #{attempt + 1})")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, self.RECONNECT_CAP)
+
+    # ── Single connection session ─────────────────────────────────────────────
 
     async def _connect(self):
+        """Run one full WebSocket session: connect → setup → steady-state → cleanup."""
         url = self.config["server"]
+
         ssl_ctx = None
         if url.startswith("wss://"):
             ssl_ctx = ssl.create_default_context()
             ssl_ctx.load_verify_locations(certifi.where())
 
+        # Open Redis for this session
         if self._redis_url:
             self._redis = await aioredis.from_url(self._redis_url, decode_responses=True)
             log.info(f"Redis connected: {self._redis_url}")
 
         try:
-            async with websockets.connect(
-                url,
-                ping_interval=20,
-                close_timeout=5,
-                max_queue=1024,
-                compression=None,
-                ssl=ssl_ctx,
-            ) as ws:
-                log.info(f"WebSocket connected: {url}")
+            # Enforce a hard timeout on the TCP handshake
+            ws = await asyncio.wait_for(
+                websockets.connect(
+                    url,
+                    ping_interval=None,  # We use Deribit's heartbeat; disable lib pings
+                    close_timeout=5,
+                    max_queue=1024,
+                    compression=None,
+                    ssl=ssl_ctx,
+                ),
+                timeout=self.SETUP_TIMEOUT,
+            )
+            log.info(f"WebSocket connected: {url}")
+        except asyncio.TimeoutError:
+            raise ConnectionError(f"WebSocket connect timed out after {self.SETUP_TIMEOUT}s")
 
-                # Start message loop first so request-response works during setup
-                loop_task = asyncio.create_task(self._message_loop(ws), name="msg_loop")
-                await asyncio.sleep(0.1)
+        self._last_msg_at = time.monotonic()
 
-                await self._login(ws)
-                await self._check_auth(ws)
-                await self._subscribe(ws)
+        try:
+            # Start the message loop first so JSON-RPC responses during setup are routed
+            loop_task = asyncio.create_task(self._message_loop(ws), name="msg_loop")
+            await asyncio.sleep(0.1)  # yield so loop_task starts reading
 
-                keepalive_task = asyncio.create_task(self._keepalive(ws), name="keepalive")
+            # All setup steps must finish within SETUP_TIMEOUT seconds total
+            try:
+                await asyncio.wait_for(self._setup(ws), timeout=self.SETUP_TIMEOUT)
+            except asyncio.TimeoutError:
+                raise ConnectionError(f"Setup timed out after {self.SETUP_TIMEOUT}s")
+
+            log.info("Setup complete — entering steady state")
+
+            keepalive_task = asyncio.create_task(self._keepalive(ws), name="keepalive")
+            watchdog_task  = asyncio.create_task(self._watchdog(),     name="watchdog")
+
+            # Run until any task finishes or raises — whichever comes first
+            done, pending = await asyncio.wait(
+                {loop_task, keepalive_task, watchdog_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            # Cancel the survivors
+            for task in pending:
+                task.cancel()
                 try:
-                    await loop_task  # runs until disconnected or error
-                finally:
-                    keepalive_task.cancel()
-                    try:
-                        await keepalive_task
-                    except asyncio.CancelledError:
-                        pass
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            # Re-raise the first exception so run() can log it and reconnect
+            for task in done:
+                if not task.cancelled() and task.exception():
+                    raise task.exception()
+
+            # All tasks completed without exception (message loop closed cleanly)
+            raise ConnectionError("WebSocket closed cleanly — reconnecting")
+
         finally:
+            try:
+                await ws.close()
+            except Exception:
+                pass
             if self._redis:
                 await self._redis.aclose()
                 self._redis = None
                 log.info("Redis connection closed")
 
-    # ------------------------------------------------------------------
-    # JSON-RPC helpers
-    # ------------------------------------------------------------------
+    # ── JSON-RPC request/response ─────────────────────────────────────────────
 
     def _next_id(self) -> str:
-        self._request_counter += 1
-        return f"{self._id_prefix}_{self._request_counter}"
+        self._req_counter += 1
+        return f"{self._id_prefix}_{self._req_counter}"
 
-    async def _send_request(self, ws, method: str, params: dict = None, timeout: float = 10.0) -> dict:
-        req_id = self._next_id()
+    async def _send_request(self, ws, method: str, params: dict = None) -> dict:
+        req_id  = self._next_id()
         payload = {
             "jsonrpc": "2.0",
-            "id": req_id,
-            "method": method,
-            "params": params or {},
+            "id":      req_id,
+            "method":  method,
+            "params":  params or {},
         }
-        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        future = asyncio.get_running_loop().create_future()
         self._pending[req_id] = future
         try:
-            log.info(f"→ {method}  params={json.dumps(params)}")
+            log.info(f"→ {method}  {json.dumps(params)}")
             await ws.send(json.dumps(payload))
-            return await asyncio.wait_for(future, timeout=timeout)
+            return await asyncio.wait_for(future, timeout=self.REQUEST_TIMEOUT)
         except asyncio.TimeoutError:
-            log.error(f"Request {req_id} ({method}) timed out after {timeout}s")
-            raise
+            raise ConnectionError(f"Request '{method}' timed out after {self.REQUEST_TIMEOUT}s")
         finally:
             self._pending.pop(req_id, None)
 
-    # ------------------------------------------------------------------
-    # Setup steps
-    # ------------------------------------------------------------------
+    # ── Setup sequence ────────────────────────────────────────────────────────
 
-    async def _login(self, ws):
+    async def _setup(self, ws):
+        """Authenticate, subscribe, and configure Deribit heartbeats."""
+        # 1. Authenticate
         trade_key = self.config["trade_key"]
         resp = await self._send_request(ws, "public/auth", {
-            "grant_type":  "client_credentials",
-            "client_id":   trade_key["access_key"],
+            "grant_type":    "client_credentials",
+            "client_id":     trade_key["access_key"],
             "client_secret": trade_key["secret_key"],
-            "scope":       self.config.get("scope", "session:cpp_og"),
+            "scope":         self.config.get("scope", "session:cpp_og"),
         })
-        assert resp.get("result", {}).get("access_token"), f"Login failed: {resp}"
+        if not resp.get("result", {}).get("access_token"):
+            raise RuntimeError(f"Login failed: {resp}")
         log.info("Login success")
 
-    async def _check_auth(self, ws):
+        # 2. Verify auth
         resp = await self._send_request(ws, "private/get_account_summary", {"currency": "BTC"})
         if resp.get("error"):
             raise RuntimeError(f"Auth check failed: {resp['error']}")
         log.info("Auth check success")
 
-    async def _subscribe(self, ws):
-        sub = self.config.get("subscription", {})
+        # 3. Subscribe to channels
+        sub  = self.config.get("subscription", {})
         resp = await self._send_request(ws, sub.get("method", "public/subscribe"), sub.get("params", {}))
-        log.info(f"Subscribed. Result: {resp}")
+        log.info(f"Subscribed: {resp}")
+
+        # 4. Ask Deribit to send heartbeat test_request probes every HEARTBEAT_INTERVAL
+        #    seconds.  We must respond with public/test or Deribit closes the connection.
+        #    This is the primary mechanism for detecting a dead connection on the server
+        #    side; our watchdog handles the client side.
+        resp = await self._send_request(ws, "public/set_heartbeat", {"interval": self.HEARTBEAT_INTERVAL})
+        log.info(f"Heartbeat set: interval={self.HEARTBEAT_INTERVAL}s  result={resp}")
+
+    # ── Background tasks ──────────────────────────────────────────────────────
 
     async def _keepalive(self, ws):
-        interval = self.config.get("ping_interval", 60)
+        """
+        Independently verify auth every KEEPALIVE_INTERVAL seconds.
+        Belt-and-suspenders on top of the Deribit heartbeat mechanism.
+        Any failure raises and triggers reconnection via asyncio.wait.
+        """
         while True:
-            await asyncio.sleep(interval)
-            try:
-                await self._check_auth(ws)
-            except Exception as e:
-                log.error(f"Keepalive failed: {e}")
-                raise
+            await asyncio.sleep(self.KEEPALIVE_INTERVAL)
+            log.info("Keepalive: verifying auth…")
+            resp = await self._send_request(ws, "private/get_account_summary", {"currency": "BTC"})
+            if resp.get("error"):
+                raise RuntimeError(f"Keepalive auth check failed: {resp['error']}")
+            log.info("Keepalive: auth OK")
 
-    # ------------------------------------------------------------------
-    # Message loop
-    # ------------------------------------------------------------------
+    async def _watchdog(self):
+        """
+        Raise WatchdogTimeout if no frame is received from the server for
+        WATCHDOG_TIMEOUT seconds.  Catches silent TCP drops where the OS
+        hasn't sent a FIN/RST and the websockets library stays blocked in recv().
+        """
+        while True:
+            await asyncio.sleep(10)
+            silence = time.monotonic() - self._last_msg_at
+            if silence > self.WATCHDOG_TIMEOUT:
+                raise WatchdogTimeout(
+                    f"No frame received for {silence:.0f}s "
+                    f"(limit {self.WATCHDOG_TIMEOUT}s) — declaring connection dead"
+                )
+
+    # ── Message loop ──────────────────────────────────────────────────────────
 
     async def _message_loop(self, ws):
+        """
+        Read all incoming WebSocket frames and classify them:
+
+          1. JSON-RPC responses  → resolve the waiting Future in _pending
+          2. Heartbeat probes    → respond with public/test immediately (no Future)
+          3. Subscription data   → persist to all enabled storage sinks
+        """
         try:
             async for raw in ws:
+                self._last_msg_at = time.monotonic()  # reset watchdog on every frame
+
                 try:
                     parsed = json.loads(raw)
                 except json.JSONDecodeError:
-                    log.warning(f"Non-JSON message ignored: {raw[:120]}")
+                    log.warning(f"Non-JSON frame ignored: {raw[:120]}")
                     continue
 
-                # Route responses back to waiting _send_request callers
+                # 1. JSON-RPC response to one of our requests
                 req_id = parsed.get("id")
                 if req_id and req_id in self._pending:
                     future = self._pending[req_id]
@@ -303,7 +417,18 @@ class DeribitRfqClient:
                         future.set_result(parsed)
                     continue
 
-                # Subscription message — persist to all enabled sinks
+                # 2. Deribit heartbeat test_request — must respond or server disconnects
+                if parsed.get("method") == "heartbeat":
+                    if parsed.get("params", {}).get("type") == "test_request":
+                        await ws.send(json.dumps({
+                            "jsonrpc": "2.0",
+                            "method":  "public/test",
+                            "params":  {},
+                        }))
+                        log.info("Heartbeat probe → responded with public/test")
+                    continue
+
+                # 3. Subscription data — write to all enabled sinks
                 doc = {"fetch_time": time.time_ns(), "message": parsed}
                 self._write_mongo(doc)
                 await self._write_redis(parsed)
@@ -313,9 +438,7 @@ class DeribitRfqClient:
             log.error(f"Message loop error: {e}")
             raise
 
-    # ------------------------------------------------------------------
-    # Storage sinks
-    # ------------------------------------------------------------------
+    # ── Storage sinks ─────────────────────────────────────────────────────────
 
     def _write_mongo(self, doc: dict):
         if self._mongo_col is None:
@@ -328,10 +451,10 @@ class DeribitRfqClient:
 
     async def _write_redis(self, parsed: dict):
         """
-        Store latest state per entity in Redis.
+        Persist latest state per entity.  Channel routing order matters:
+        block_rfq.maker.quotes.* must be checked before block_rfq.maker.*
+        because the latter is a substring of the former.
 
-        Channel routing (quotes checked before generic maker because
-        block_rfq.maker.quotes.* also matches "block_rfq.maker.*"):
           block_rfq.maker.quotes.*  →  rfq_quote:<block_rfq_quote_id>
           block_rfq.maker.*         →  rfq:<block_rfq_id>
           block_rfq.trades.*        →  rfq_trade:<block_rfq_id>
@@ -342,26 +465,29 @@ class DeribitRfqClient:
             if parsed.get("method") != "subscription":
                 return
             channel = parsed.get("params", {}).get("channel", "")
-            data = parsed.get("params", {}).get("data")
+            data    = parsed.get("params", {}).get("data")
             if not isinstance(data, dict):
                 return
 
             if "block_rfq.maker.quotes." in channel:
-                quote_id = data.get("block_rfq_quote_id")
-                if quote_id:
-                    await self._redis.set(f"rfq_quote:{quote_id}", json.dumps(data))
-                    log.info(f"[Redis] rfq_quote:{quote_id}")
+                qid = data.get("block_rfq_quote_id")
+                if qid:
+                    await self._redis.set(f"rfq_quote:{qid}", json.dumps(data))
+                    await self._redis.publish("rfq_updates", json.dumps({"type": "rfq_quote", "id": qid}))
+                    log.info(f"[Redis] rfq_quote:{qid}")
 
             elif "block_rfq.maker." in channel:
                 rfq_id = data.get("block_rfq_id")
                 if rfq_id:
                     await self._redis.set(f"rfq:{rfq_id}", json.dumps(data))
+                    await self._redis.publish("rfq_updates", json.dumps({"type": "rfq", "id": rfq_id, "data": data}))
                     log.info(f"[Redis] rfq:{rfq_id}  state={data.get('state')}")
 
             elif "block_rfq.trades." in channel:
                 rfq_id = data.get("block_rfq_id")
                 if rfq_id:
                     await self._redis.set(f"rfq_trade:{rfq_id}", json.dumps(data))
+                    await self._redis.publish("rfq_updates", json.dumps({"type": "rfq_trade", "id": rfq_id}))
                     log.info(f"[Redis] rfq_trade:{rfq_id}")
 
         except Exception as e:
@@ -387,7 +513,7 @@ def main():
         default="config/ws_client_config_mongodb_redis.json",
         help="Path to JSON config file",
     )
-    args = parser.parse_args()
+    args   = parser.parse_args()
     config = load_config(args.config)
     log.info(f"Config loaded from {args.config}")
     try:
