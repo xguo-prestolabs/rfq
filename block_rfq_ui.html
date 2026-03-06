@@ -1319,7 +1319,7 @@ async function pollRecentTrades() {
       const ts  = t.timestamp ? fmtAgo(t.timestamp) : '—';
       const legs = (t.legs || []).map(l => {
         const d = l.direction === 'buy' ? '<span class="pos">B</span>' : '<span class="neg">S</span>';
-        return `${d} ${l.instrument_name}`;
+        return `${d} ${esc(l.instrument_name)}`;
       }).join('<br>');
       const dirCls = dir === 'buy' ? 'pos' : 'neg';
       return `<div class="trade-card">

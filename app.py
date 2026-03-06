@@ -13,20 +13,8 @@ from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
-from pymongo import MongoClient
-from bson import json_util
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
-
-
-def get_mongo_connection(app: FastAPI, testnet: bool = False):
-    mongo_uri = "mongodb://options:options@1.tcp.ngrok.io:25657/?authSource=admin"
-    mongo_client = MongoClient(mongo_uri)
-    db = mongo_client["deribit_block_rfq"]
-    collection_name = "messages_testnet" if testnet else "messages"
-    mongo_collection = db[collection_name]
-    app.state.mongo_client = mongo_client
-    app.state.mongo_collection = mongo_collection
 
 
 # Pydantic models for request validation
@@ -178,7 +166,6 @@ async def lifespan(app: FastAPI):
 
     app.state.http_session = aiohttp.ClientSession()
     print("HTTP session created for Deribit API")
-    get_mongo_connection(app, testnet=testnet)
 
     app.state.broadcaster = asyncio.create_task(
         _pubsub_broadcaster("redis://localhost:6379")
@@ -196,8 +183,6 @@ async def lifespan(app: FastAPI):
     print("Broadcaster stopped")
     await app.state.redis_client.close()
     print("Redis connection closed")
-    app.state.mongo_client.close()
-    print("MongoDB connection closed")
     await app.state.http_session.close()
     print("HTTP session closed")
 
@@ -324,6 +309,8 @@ async def get_total_greeks(request: Request):
     t0 = time.perf_counter()
     greeks = await request.app.state.redis_client.get("total_greeks:ALL")
     _stats["GET /total_greeks"].record((time.perf_counter() - t0) * 1000)
+    if not greeks:
+        return {"total_greeks": {}}
     data = json.loads(greeks)
     return {
         "total_greeks": data
@@ -372,36 +359,6 @@ async def get_rfqs(request: Request):
     _stats["GET /rfqs — MGET"].record(mget_ms)
     _stats["GET /rfqs — total"].record(keys_ms + mget_ms)
     print(f"[Redis] KEYS rfq:* ({len(keys)} keys) — {keys_ms:.1f} ms | MGET — {mget_ms:.1f} ms | total — {keys_ms+mget_ms:.1f} ms")
-    return results
-
-
-@app.get("/rfqs/mongodb")
-async def get_rfqs_from_mongodb(request: Request):
-    """Get all RFQs from MongoDB (last 10 hours), newest state per RFQ."""
-    mongo_collection = request.app.state.mongo_collection
-    nanos_per_hour = 3600 * 1_000_000_000
-    ten_hours_ago_ns = time.time_ns() - (10 * nanos_per_hour)
-    query = {"fetch_time": {"$gte": ten_hours_ago_ns}}
-    t0 = time.perf_counter()
-    cursor = mongo_collection.find(query).sort("fetch_time", -1)
-    results = {}
-    for doc in cursor:
-        doc_json = json.loads(json_util.dumps(doc))
-        msg_json = doc_json.get("message")
-        if msg_json.get("method") == "subscription":
-            params = msg_json.get("params", {})
-            channel = params.get("channel", "")
-            data = params.get("data")
-
-            # Cursor is sorted fetch_time DESC so the first doc seen per rfq_id is the
-            # most recent — skip subsequent (older) docs for the same rfq_id.
-            if "block_rfq.maker." in channel and "quotes" not in channel:
-                if isinstance(data, dict):
-                    rfq_id = data.get("block_rfq_id")
-                    if rfq_id and rfq_id not in results:
-                        results[rfq_id] = data
-    _stats["GET /rfqs/mongodb"].record((time.perf_counter() - t0) * 1000)
-    print(f"[MongoDB] find /rfqs/mongodb ({len(results)} RFQs) — {(time.perf_counter()-t0)*1000:.1f} ms")
     return results
 
 
@@ -495,7 +452,7 @@ async def get_rfq_status(rfq_id: str, request: Request):
                         "state": rfq.get("state"),
                         "rfq": rfq
                     }
-        except:
+        except Exception:
             pass
 
         # Try ETH
@@ -513,34 +470,6 @@ async def get_rfq_status(rfq_id: str, request: Request):
                     "rfq": rfq
                 }
 
-        # If not found in API, try MongoDB
-        mongo_collection = request.app.state.mongo_collection
-        nanos_per_hour = 3600 * 1_000_000_000
-        ten_hours_ago_ns = time.time_ns() - (10 * nanos_per_hour)
-        query = {"fetch_time": {"$gte": ten_hours_ago_ns}}
-        t0 = time.perf_counter()
-        cursor = mongo_collection.find(query).sort("fetch_time", -1)
-
-        for doc in cursor:
-            doc_json = json.loads(json_util.dumps(doc))
-            msg_json = doc_json.get("message")
-            if msg_json.get("method") == "subscription":
-                params = msg_json.get("params", {})
-                channel = params.get("channel", "")
-                data = params.get("data")
-
-                if "block_rfq.maker." in channel and "quotes" not in channel:
-                    if isinstance(data, dict) and data.get("block_rfq_id") == rfq_id:
-                        print(f"[MongoDB] find /rfqs/{rfq_id} (fallback) — {(time.perf_counter()-t0)*1000:.1f} ms")
-                        return {
-                            "status": "success",
-                            "rfq_id": rfq_id,
-                            "state": data.get("state"),
-                            "rfq": data,
-                            "source": "mongodb_cache"
-                        }
-
-        print(f"[MongoDB] find /rfqs/{rfq_id} (fallback, not found) — {(time.perf_counter()-t0)*1000:.1f} ms")
         raise HTTPException(
             status_code=404,
             detail=f"RFQ {rfq_id} not found"
@@ -901,7 +830,7 @@ async def get_quote_by_id(quote_id: str, request: Request):
                         "status": "success",
                         "quote": quote
                     }
-        except:
+        except Exception:
             pass
 
         # Try ETH
