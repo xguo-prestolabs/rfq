@@ -58,7 +58,8 @@ uv run python app.py --config config.json --testnet --port 8000
 | `price:{instrument}` | C++ options_mm | Fair price with `strat_mid_price` and `ts` fields |
 | `greeks:{instrument}` | C++ options_mm | Per-instrument greeks (`delta`, `gamma`, `vega`) |
 | `total_greeks:ALL` | C++ options_mm | Aggregated portfolio greeks |
-| `rfq:{block_rfq_id}` | ws_client_redis.py | Latest RFQ state from Deribit |
+| `rfq:{block_rfq_id}` | ws_client_redis.py | Latest maker RFQ state from Deribit |
+| `rfq_taker:{block_rfq_id}` | ws_client_redis.py | Latest taker RFQ state from Deribit |
 | `rfq_trade:{block_rfq_id}` | ws_client_redis.py | Trade execution data |
 | `rfq_quote:{quote_id}` | ws_client_redis.py | Quote state snapshot |
 

@@ -69,6 +69,7 @@ import json
 import logging
 import pathlib
 import ssl
+import subprocess
 import time
 from typing import Dict, Optional
 
@@ -82,6 +83,20 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger(__name__)
+
+
+def _get_git_version() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+_META = {"program": "ws_client_redis", "version": _get_git_version()}
 
 
 # ---------------------------------------------------------------------------
@@ -429,9 +444,10 @@ class DeribitRfqClient:
                     continue
 
                 # 3. Subscription data — write to all enabled sinks
-                doc = {"fetch_time": time.time_ns(), "message": parsed}
+                channel = parsed.get("params", {}).get("channel", "")
+                doc = {"fetch_time": time.time_ns(), "channel": channel, "meta": _META, "message": parsed}
                 self._write_mongo(doc)
-                await self._write_redis(parsed)
+                await self._write_redis(doc)
                 self._write_file(doc)
 
         except Exception as e:
@@ -449,7 +465,7 @@ class DeribitRfqClient:
         except Exception as e:
             log.error(f"[MongoDB] write failed: {e}")
 
-    async def _write_redis(self, parsed: dict):
+    async def _write_redis(self, doc: dict):
         """
         Persist latest state per entity.  Channel routing order matters:
         block_rfq.maker.quotes.* must be checked before block_rfq.maker.*
@@ -457,37 +473,50 @@ class DeribitRfqClient:
 
           block_rfq.maker.quotes.*  →  rfq_quote:<block_rfq_quote_id>
           block_rfq.maker.*         →  rfq:<block_rfq_id>
-          block_rfq.taker.*         →  rfq:<block_rfq_id>
+          block_rfq.taker.*         →  rfq_taker:<block_rfq_id>
           block_rfq.trades.*        →  rfq_trade:<block_rfq_id>
+
+        Redis values use the same doc format as MongoDB/file:
+          {"fetch_time": <ns>, "channel": <str>, "message": <parsed>}
         """
         if self._redis is None:
             return
         try:
+            parsed = doc["message"]
             if parsed.get("method") != "subscription":
                 return
-            channel = parsed.get("params", {}).get("channel", "")
+            channel = doc["channel"]
             data    = parsed.get("params", {}).get("data")
             if not isinstance(data, dict):
                 return
 
+            doc_json = json.dumps(doc)
+
             if "block_rfq.maker.quotes." in channel:
                 qid = data.get("block_rfq_quote_id")
                 if qid:
-                    await self._redis.set(f"rfq_quote:{qid}", json.dumps(data))
+                    await self._redis.set(f"rfq_quote:{qid}", doc_json)
                     await self._redis.publish("rfq_updates", json.dumps({"type": "rfq_quote", "id": qid}))
                     log.info(f"[Redis] rfq_quote:{qid}")
 
-            elif "block_rfq.maker." in channel or "block_rfq.taker." in channel:
+            elif "block_rfq.maker." in channel:
                 rfq_id = data.get("block_rfq_id")
                 if rfq_id:
-                    await self._redis.set(f"rfq:{rfq_id}", json.dumps(data))
+                    await self._redis.set(f"rfq:{rfq_id}", doc_json)
                     await self._redis.publish("rfq_updates", json.dumps({"type": "rfq", "id": rfq_id, "data": data}))
-                    log.info(f"[Redis] rfq:{rfq_id}  channel={channel}  state={data.get('state')}")
+                    log.info(f"[Redis] rfq:{rfq_id}  state={data.get('state')}")
+
+            elif "block_rfq.taker." in channel:
+                rfq_id = data.get("block_rfq_id")
+                if rfq_id:
+                    await self._redis.set(f"rfq_taker:{rfq_id}", doc_json)
+                    await self._redis.publish("rfq_updates", json.dumps({"type": "rfq_taker", "id": rfq_id, "data": data}))
+                    log.info(f"[Redis] rfq_taker:{rfq_id}  state={data.get('state')}")
 
             elif "block_rfq.trades." in channel:
                 rfq_id = data.get("block_rfq_id")
                 if rfq_id:
-                    await self._redis.set(f"rfq_trade:{rfq_id}", json.dumps(data))
+                    await self._redis.set(f"rfq_trade:{rfq_id}", doc_json)
                     await self._redis.publish("rfq_updates", json.dumps({"type": "rfq_trade", "id": rfq_id}))
                     log.info(f"[Redis] rfq_trade:{rfq_id}")
 

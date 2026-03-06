@@ -327,7 +327,8 @@ async def get_trades(request: Request):
         for v in values:
             if v:
                 try:
-                    trades.append(json.loads(v))
+                    doc = json.loads(v)
+                    trades.append(doc.get("message", {}).get("params", {}).get("data", doc))
                 except Exception:
                     pass
     trades.sort(key=lambda t: t.get("timestamp", 0), reverse=True)
@@ -351,7 +352,8 @@ async def get_rfqs(request: Request):
         for key, value in zip(keys, values):
             if value:
                 rfq_id = int(key.split(":", 1)[1])
-                results[rfq_id] = json.loads(value)
+                doc = json.loads(value)
+                results[rfq_id] = doc.get("message", {}).get("params", {}).get("data", doc)
     else:
         t2 = time.perf_counter()
     keys_ms, mget_ms = (t1-t0)*1000, (t2-t1)*1000
@@ -359,6 +361,23 @@ async def get_rfqs(request: Request):
     _stats["GET /rfqs — MGET"].record(mget_ms)
     _stats["GET /rfqs — total"].record(keys_ms + mget_ms)
     print(f"[Redis] KEYS rfq:* ({len(keys)} keys) — {keys_ms:.1f} ms | MGET — {mget_ms:.1f} ms | total — {keys_ms+mget_ms:.1f} ms")
+    return results
+
+
+@app.get("/rfqs/taker")
+async def get_rfqs_taker(request: Request):
+    """Get all taker RFQs from Redis (rfq_taker:* keys)."""
+    t0 = time.perf_counter()
+    keys = await request.app.state.redis_client.keys("rfq_taker:*")
+    results = {}
+    if keys:
+        values = await request.app.state.redis_client.mget(keys)
+        for key, value in zip(keys, values):
+            if value:
+                rfq_id = int(key.split(":", 1)[1])
+                doc = json.loads(value)
+                results[rfq_id] = doc.get("message", {}).get("params", {}).get("data", doc)
+    _stats["GET /rfqs/taker"].record((time.perf_counter() - t0) * 1000)
     return results
 
 

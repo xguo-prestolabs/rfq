@@ -1248,8 +1248,8 @@ async function handleLiveUpdate(rawMsg) {
   let m;
   try { m = JSON.parse(rawMsg); } catch { return; }
 
-  // Only handle block_rfq.maker.* RFQ state updates for now
-  if (m.type !== 'rfq' || !m.id || !m.data) return;
+  // Handle block_rfq.maker.* and block_rfq.taker.* RFQ state updates
+  if ((m.type !== 'rfq' && m.type !== 'rfq_taker') || !m.id || !m.data) return;
 
   const id      = String(m.id);
   const newData = m.data;  // full Deribit RFQ payload
