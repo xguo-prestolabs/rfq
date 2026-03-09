@@ -631,6 +631,11 @@ async function loadRFQs() {
     // Open RFQs are actionable — render them all in parallel first.
     await Promise.all(openIds.map(renderOne));
 
+    // Start countdown and load quotes immediately after open RFQs are ready,
+    // rather than waiting for all non-open batches to finish.
+    startCountdowns();
+    loadMyQuotes();
+
     // Expired/cancelled/filled RFQs are processed in batches of 5 so they don't
     // flood the server with all requests at once while still finishing faster than
     // fully sequential (one-at-a-time) processing.
@@ -638,9 +643,6 @@ async function loadRFQs() {
     for (let i = 0; i < otherIds.length; i += BATCH) {
       await Promise.all(otherIds.slice(i, i + BATCH).map(renderOne));
     }
-
-    startCountdowns();
-    loadMyQuotes();
 
   } catch (e) {
     cont.innerHTML = `<div class="alert alert-danger">Error: ${esc(e.message)}</div>`;
@@ -830,14 +832,15 @@ function toggleCard(id) {
 }
 
 function syncButtons(id) {
-  const qid  = S.quoteIds[id];
+  const qid    = S.quoteIds[id];
+  const isOpen = S.rfqCache[id]?.state === 'open';
   const bSub = document.getElementById(`btn-sub-${id}`);
   const bEdt = document.getElementById(`btn-edt-${id}`);
   const bCan = document.getElementById(`btn-can-${id}`);
   const info = document.getElementById(`qinfo-${id}`);
   if (!bSub) return;
-  bSub.disabled = !!qid;
-  bEdt.disabled = !qid;
+  bSub.disabled = !!qid || !isOpen;
+  bEdt.disabled = !qid || !isOpen;
   bCan.disabled = !qid;
   info.textContent = qid ? `Active quote ID: ${qid}` : '';
 }
@@ -1262,6 +1265,7 @@ async function handleLiveUpdate(rawMsg) {
       const badge = card.querySelector('.rfq-header .badge');
       if (badge) badge.outerHTML = stateBadge(newData.state);
     }
+    syncButtons(id);
     document.getElementById('ts').textContent = new Date().toLocaleTimeString();
 
   } else {

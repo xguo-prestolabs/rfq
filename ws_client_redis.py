@@ -498,7 +498,7 @@ class DeribitRfqClient:
             if data is None:
                 return
 
-            doc_json = json.dumps(doc)
+            doc_json = json.dumps({k: v for k, v in doc.items() if k != "_id"})
 
             if "block_rfq.maker.quotes." in channel:
                 # data is a list of quote objects
