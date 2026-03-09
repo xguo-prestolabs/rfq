@@ -2,6 +2,7 @@
   hosts: prod
   vars:
     remote_dir: ~/workspace/basis_strat2/20200407/wps_py
+    local_git_version: "{{ lookup('pipe', 'git rev-parse --short HEAD') }}"
   tasks:
     - name: Copy application and config files
       ansible.builtin.copy:
@@ -14,3 +15,8 @@
         - config/ws_client_config_testnet_mongodb.json
         - config/ws_client_config_mongodb_redis.json
         - config/ws_client_config_testnet_mongodb_redis.json
+
+    - name: Create VERSION file with local commit hash
+      ansible.builtin.copy:
+        content: "{{ local_git_version }}\n"
+        dest: "{{ remote_dir }}/VERSION"

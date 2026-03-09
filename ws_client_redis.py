@@ -495,19 +495,24 @@ class DeribitRfqClient:
                 return
             channel = doc["channel"]
             data    = parsed.get("params", {}).get("data")
-            if not isinstance(data, dict):
+            if data is None:
                 return
 
             doc_json = json.dumps(doc)
 
             if "block_rfq.maker.quotes." in channel:
-                qid = data.get("block_rfq_quote_id")
-                if qid:
-                    await self._redis.set(f"rfq_quote:{qid}", doc_json)
-                    await self._redis.publish("rfq_updates", json.dumps({"type": "rfq_quote", "id": qid}))
-                    log.info(f"[Redis] rfq_quote:{qid}")
+                # data is a list of quote objects
+                quotes = data if isinstance(data, list) else [data]
+                for q in quotes:
+                    qid = q.get("block_rfq_quote_id")
+                    if qid:
+                        await self._redis.set(f"rfq_quote:{qid}", doc_json)
+                        await self._redis.publish("rfq_updates", json.dumps({"type": "rfq_quote", "id": qid}))
+                        log.info(f"[Redis] rfq_quote:{qid}")
 
             elif "block_rfq.maker." in channel:
+                if not isinstance(data, dict):
+                    return
                 rfq_id = data.get("block_rfq_id")
                 if rfq_id:
                     await self._redis.set(f"rfq:{rfq_id}", doc_json)
@@ -515,6 +520,8 @@ class DeribitRfqClient:
                     log.info(f"[Redis] rfq:{rfq_id}  state={data.get('state')}")
 
             elif "block_rfq.taker." in channel:
+                if not isinstance(data, dict):
+                    return
                 rfq_id = data.get("block_rfq_id")
                 if rfq_id:
                     await self._redis.set(f"rfq_taker:{rfq_id}", doc_json)
@@ -522,7 +529,9 @@ class DeribitRfqClient:
                     log.info(f"[Redis] rfq_taker:{rfq_id}  state={data.get('state')}")
 
             elif "block_rfq.trades." in channel:
-                rfq_id = data.get("block_rfq_id")
+                if not isinstance(data, dict):
+                    return
+                rfq_id = data.get("id") or data.get("block_rfq_id")
                 if rfq_id:
                     await self._redis.set(f"rfq_trade:{rfq_id}", doc_json)
                     await self._redis.publish("rfq_updates", json.dumps({"type": "rfq_trade", "id": rfq_id}))
