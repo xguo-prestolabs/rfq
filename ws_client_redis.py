@@ -86,6 +86,7 @@ log = logging.getLogger(__name__)
 
 
 def _get_git_version() -> str:
+    # Try git command first
     try:
         return subprocess.check_output(
             ["git", "rev-parse", "--short", "HEAD"],
@@ -93,7 +94,14 @@ def _get_git_version() -> str:
             text=True,
         ).strip()
     except Exception:
-        return "unknown"
+        pass
+
+    # Fallback to VERSION file
+    version_file = pathlib.Path(__file__).parent / "VERSION"
+    if version_file.exists():
+        return version_file.read_text().strip()
+
+    return "unknown"
 
 
 _META = {"program": "ws_client_redis", "version": _get_git_version()}
