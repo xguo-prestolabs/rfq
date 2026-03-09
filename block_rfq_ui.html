@@ -852,7 +852,8 @@ function syncButtons(id) {
 // via public/get_instrument → result.tick_size.
 const OPTION_TICK_SIZE = 0.0001;
 function roundToTick(price, tick = OPTION_TICK_SIZE) {
-  return Math.round(price / tick) * tick;
+  const decimals = Math.max(0, -Math.floor(Math.log10(tick)));
+  return (Math.round(price / tick) * tick).toFixed(decimals);
 }
 
 function collectLegs(id) {
