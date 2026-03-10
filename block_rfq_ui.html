@@ -467,7 +467,7 @@ tbody td { padding: 6px 10px; vertical-align: middle; }
     <div id="tab-info" class="tab-pane">
       <div style="max-width:800px;padding:16px;line-height:1.7;font-size:14px">
 
-        <h2 style="margin-top:0">Position Dollar Greeks (Sidebar)</h2>
+        <h2 style="margin-top:0">1. Position Dollar Greeks (Sidebar)</h2>
         <p>
           The sidebar shows the <strong>total portfolio dollar greeks</strong> aggregated across
           all positions. These are computed by the C++ pricer and published to Redis as
@@ -479,29 +479,70 @@ tbody td { padding: 6px 10px; vertical-align: middle; }
           <li><strong>Dollar Vega</strong> — P&amp;L change (in USD) for a 1-point (absolute) move in implied volatility.</li>
         </ul>
 
-        <h2>Per-Leg Dollar Greeks (RFQ Cards)</h2>
+        <h2>2. Per-Leg Dollar Greeks (RFQ Cards)</h2>
         <p>
-          Each RFQ card shows per-leg dollar greeks derived from the raw greeks
-          (<code>/greeks/{instrument}</code>) and the underlying index price \(S\).
-          The raw greeks \(\delta, \gamma, \nu\) are unit greeks per 1 coin of the option:
+          Each RFQ card shows per-leg dollar greeks derived from the raw (unit) greeks
+          returned by <code>/greeks/{instrument}</code> and the underlying index price \(S\).
         </p>
+        <p>
+          The raw greeks from the C++ pricer are <em>per 1 coin of the underlying</em>:
+        </p>
+        <ul>
+          <li>\(\delta\) — option delta (dimensionless, range roughly &minus;1 to +1)</li>
+          <li>\(\gamma\) — option gamma (second derivative of price w.r.t. underlying)</li>
+          <li>\(\nu\) — option vega (Black vega, already denominated in USD)</li>
+        </ul>
 
-        <p><strong>Dollar Delta</strong> — sensitivity to a $1 move in the underlying:</p>
+        <h3>2.1 Dollar Delta</h3>
+        <p>
+          Dollar Delta measures the P&amp;L impact (in USD) of a <strong>$1 move</strong> in the
+          underlying spot price. It converts the dimensionless delta into a dollar amount:
+        </p>
         \[
           \Delta_{\$} = \delta \times S
         \]
+        <p>
+          where \(S\) is the current index price (e.g. <code>btc_usd</code> or <code>eth_usd</code>).
+        </p>
+        <p>
+          <em>Example:</em> If \(\delta = 0.55\) and \(S = 70{,}000\), then
+          \(\Delta_{\$} = 0.55 \times 70{,}000 = 38{,}500\). A $1 increase in BTC
+          changes the position value by $38,500.
+        </p>
 
-        <p><strong>Dollar Gamma</strong> — change in Dollar Delta for a 1% move in the underlying:</p>
+        <h3>2.2 Dollar Gamma</h3>
+        <p>
+          Dollar Gamma measures how much <strong>Dollar Delta changes</strong> when the underlying
+          moves by <strong>1%</strong>:
+        </p>
         \[
           \Gamma_{\$} = \gamma \times S^2 \times 0.01
         \]
+        <p>
+          The \(S^2\) factor converts gamma from "per coin²" units to dollar terms, and the
+          \(0.01\) factor scales it to a 1% move.
+        </p>
+        <p>
+          <em>Example:</em> If \(\gamma = 0.00002\) and \(S = 70{,}000\), then
+          \(\Gamma_{\$} = 0.00002 \times 70{,}000^2 \times 0.01 = 980\). A 1% move in BTC
+          changes Dollar Delta by $980.
+        </p>
 
-        <p><strong>Dollar Vega</strong> — the vega from the pricer is already in dollar terms (Black vega), so no conversion is needed:</p>
+        <h3>2.3 Dollar Vega</h3>
+        <p>
+          Dollar Vega measures the P&amp;L impact of a <strong>1-point change</strong> in implied
+          volatility. The vega returned by the C++ pricer (Black vega) is already in USD,
+          so no conversion is needed:
+        </p>
         \[
           \mathcal{V}_{\$} = \nu
         \]
+        <p>
+          <em>Example:</em> If \(\nu = 120\), then a 1-point increase in IV (e.g. 50% → 51%)
+          changes the position value by $120.
+        </p>
 
-        <h3>Combo (Multi-Leg) Aggregation</h3>
+        <h3>2.4 Combo (Multi-Leg) Aggregation</h3>
         <p>
           For multi-leg RFQs, each leg has a <em>signed ratio</em>: positive for buy legs,
           negative for sell legs. The combo greek is the weighted sum:
@@ -513,8 +554,12 @@ tbody td { padding: 6px 10px; vertical-align: middle; }
           where \(r_i = \text{ratio}_i \times s_i\), with \(s_i = +1\) for buy and \(s_i = -1\) for sell,
           and \(G_i\) is any of \(\Delta_{\$}, \Gamma_{\$}, \mathcal{V}_{\$}\) for leg \(i\).
         </p>
+        <p>
+          <em>Example (straddle):</em> Buy 1× 70000-C (\(\Delta_{\$} = 38{,}500\)) and buy 1× 70000-P
+          (\(\Delta_{\$} = -31{,}500\)). Combo \(\Delta_{\$} = 38{,}500 + (-31{,}500) = 7{,}000\).
+        </p>
 
-        <h2>Edge Parameter</h2>
+        <h2>3. Edge Parameter</h2>
         <p>
           The <strong>Edge</strong> slider on each RFQ card adjusts the quoted leg prices
           relative to the fair price. The edge is specified in <em>ticks</em>
@@ -524,8 +569,11 @@ tbody td { padding: 6px 10px; vertical-align: middle; }
           When the slider is set to \(e\) ticks, each leg's quote price is computed as:
         </p>
         \[
-          P_{\text{quote}} = \text{round\_to\_tick}\!\Big(\max\!\big(0,\; P_{\text{fair}} + e \times 0.0001\big)\Big)
+          P_{\text{quote}} = \operatorname{roundToTick}\!\Big(\max\!\big(0,\; P_{\text{fair}} + e \times 0.0001\big)\Big)
         \]
+        <p>
+          where \(\operatorname{roundToTick}(x)\) rounds \(x\) to the nearest multiple of the tick size (0.0001).
+        </p>
         <p>
           A <strong>positive edge</strong> increases the quoted price above fair (more aggressive
           when selling, more conservative when buying). A <strong>negative edge</strong> decreases
