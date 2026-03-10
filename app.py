@@ -642,6 +642,13 @@ async def add_quote(quote: QuoteRequest, request: Request):
 
         print(f"Quote added successfully: {result}")
 
+        # Store in Redis for 48 hours
+        qid = result.get("block_rfq_quote_id") or result.get("quote_id")
+        if qid:
+            redis_client = request.app.state.redis_client
+            record = {"timestamp": time.time_ns(), "action": "submit", "params": params, "result": result}
+            await redis_client.set(f"rfq_user:submit:{qid}", json.dumps(record, default=str), ex=48 * 3600)
+
         return {
             "status": "success",
             "quote_id": result.get("quote_id"),
@@ -684,6 +691,11 @@ async def cancel_quote(cancel_req: CancelQuoteRequest, request: Request):
         )
 
         print(f"Quote canceled successfully: {result}")
+
+        # Store in Redis for 48 hours
+        redis_client = request.app.state.redis_client
+        record = {"timestamp": time.time_ns(), "action": "cancel", "params": params, "result": result}
+        await redis_client.set(f"rfq_user:cancel:{cancel_req.quote_id}", json.dumps(record, default=str), ex=48 * 3600)
 
         return {
             "status": "success",
@@ -733,6 +745,11 @@ async def edit_quote(edit_req: EditQuoteRequest, request: Request):
 
         print(f"Quote edited successfully: {result}")
 
+        # Store in Redis for 48 hours
+        redis_client = request.app.state.redis_client
+        record = {"timestamp": time.time_ns(), "action": "edit", "params": params, "result": result}
+        await redis_client.set(f"rfq_user:edit:{edit_req.quote_id}", json.dumps(record, default=str), ex=48 * 3600)
+
         return {
             "status": "success",
             "quote_id": edit_req.quote_id,
@@ -774,9 +791,16 @@ async def cancel_all_quotes(cancel_all_req: CancelAllQuotesRequest, request: Req
 
         print(f"All quotes canceled successfully: {result}")
 
+        # Store in Redis for 48 hours
+        redis_client = request.app.state.redis_client
+        ts = time.time_ns()
+        currency = cancel_all_req.currency or "all"
+        record = {"timestamp": ts, "action": "cancel_all", "currency": currency, "params": params, "result": result}
+        await redis_client.set(f"rfq_user:cancel_all:{ts}", json.dumps(record, default=str), ex=48 * 3600)
+
         return {
             "status": "success",
-            "currency": cancel_all_req.currency or "all",
+            "currency": currency,
             "result": result
         }
 

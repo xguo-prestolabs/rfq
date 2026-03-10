@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Deribit Block RFQ – Market Maker</title>
+<script>window.MathJax = { tex: { inlineMath: [['\\(','\\)']], displayMath: [['\\[','\\]']] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
 <style>
 /* ── Reset & variables ─────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -447,6 +449,7 @@ tbody td { padding: 6px 10px; vertical-align: middle; }
     <div class="tabs">
       <button class="tab-btn active" data-tab="rfqs"   onclick="switchTab(this)">📋 RFQs</button>
       <button class="tab-btn"        data-tab="quotes" onclick="switchTab(this)">💬 My Quotes</button>
+      <button class="tab-btn"        data-tab="info"   onclick="switchTab(this)">📖 Info</button>
     </div>
 
     <div id="tab-rfqs" class="tab-pane active">
@@ -458,6 +461,84 @@ tbody td { padding: 6px 10px; vertical-align: middle; }
     <div id="tab-quotes" class="tab-pane">
       <div id="quotes-container">
         <div class="loading"><span class="spin"></span> Loading quotes…</div>
+      </div>
+    </div>
+
+    <div id="tab-info" class="tab-pane">
+      <div style="max-width:800px;padding:16px;line-height:1.7;font-size:14px">
+
+        <h2 style="margin-top:0">Position Dollar Greeks (Sidebar)</h2>
+        <p>
+          The sidebar shows the <strong>total portfolio dollar greeks</strong> aggregated across
+          all positions. These are computed by the C++ pricer and published to Redis as
+          <code>total_greeks:ALL</code>. The three values displayed are:
+        </p>
+        <ul>
+          <li><strong>Dollar Delta</strong> — P&amp;L change (in USD) for a $1 move in the underlying.</li>
+          <li><strong>Dollar Gamma</strong> — change in Dollar Delta for a 1% move in the underlying.</li>
+          <li><strong>Dollar Vega</strong> — P&amp;L change (in USD) for a 1-point (absolute) move in implied volatility.</li>
+        </ul>
+
+        <h2>Per-Leg Dollar Greeks (RFQ Cards)</h2>
+        <p>
+          Each RFQ card shows per-leg dollar greeks derived from the raw greeks
+          (<code>/greeks/{instrument}</code>) and the underlying index price \(S\).
+          The raw greeks \(\delta, \gamma, \nu\) are unit greeks per 1 coin of the option:
+        </p>
+
+        <p><strong>Dollar Delta</strong> — sensitivity to a $1 move in the underlying:</p>
+        \[
+          \Delta_{\$} = \delta \times S
+        \]
+
+        <p><strong>Dollar Gamma</strong> — change in Dollar Delta for a 1% move in the underlying:</p>
+        \[
+          \Gamma_{\$} = \gamma \times S^2 \times 0.01
+        \]
+
+        <p><strong>Dollar Vega</strong> — the vega from the pricer is already in dollar terms (Black vega), so no conversion is needed:</p>
+        \[
+          \mathcal{V}_{\$} = \nu
+        \]
+
+        <h3>Combo (Multi-Leg) Aggregation</h3>
+        <p>
+          For multi-leg RFQs, each leg has a <em>signed ratio</em>: positive for buy legs,
+          negative for sell legs. The combo greek is the weighted sum:
+        </p>
+        \[
+          G_{\text{combo}} = \sum_{i} r_i \times G_i
+        \]
+        <p>
+          where \(r_i = \text{ratio}_i \times s_i\), with \(s_i = +1\) for buy and \(s_i = -1\) for sell,
+          and \(G_i\) is any of \(\Delta_{\$}, \Gamma_{\$}, \mathcal{V}_{\$}\) for leg \(i\).
+        </p>
+
+        <h2>Edge Parameter</h2>
+        <p>
+          The <strong>Edge</strong> slider on each RFQ card adjusts the quoted leg prices
+          relative to the fair price. The edge is specified in <em>ticks</em>
+          (1 tick = <code>0.0001</code> for BTC/ETH options).
+        </p>
+        <p>
+          When the slider is set to \(e\) ticks, each leg's quote price is computed as:
+        </p>
+        \[
+          P_{\text{quote}} = \text{round\_to\_tick}\!\Big(\max\!\big(0,\; P_{\text{fair}} + e \times 0.0001\big)\Big)
+        \]
+        <p>
+          A <strong>positive edge</strong> increases the quoted price above fair (more aggressive
+          when selling, more conservative when buying). A <strong>negative edge</strong> decreases
+          the price below fair.
+        </p>
+        <p>
+          The edge is automatically reapplied whenever fair prices refresh (every second for open RFQs),
+          keeping the quote inputs at a consistent offset from the live fair value.
+        </p>
+        <p class="dim" style="font-size:12px;margin-top:4px">
+          Range: &minus;20 to +20 ticks &nbsp;|&nbsp; Default: 0 (quote at fair price)
+        </p>
+
       </div>
     </div>
 
@@ -494,6 +575,7 @@ const S = {
   quoteIds:   {},   // rfqId (str) → most recent open block_rfq_quote_id
   myQuotes:   {},   // rfqId (str) → [quote, …] all quotes for that RFQ
   rfqCache:   {},   // rfqId (str) → enriched rfq object
+  edge:       {},   // rfqId (str) → current edge value (number of ticks)
   timer:      null,
   ttxTimer:   null, // per-second countdown timer
   priceTimer: null, // per-second fair price updater for open RFQs
@@ -563,7 +645,9 @@ function toggleAutoRefresh() {
 }
 
 function refresh() {
-  if (S.tab === 'rfqs') loadRFQs(); else loadQuotes();
+  if (S.tab === 'rfqs') loadRFQs();
+  else if (S.tab === 'quotes') loadQuotes();
+  // info tab is static — no refresh needed
   document.getElementById('ts').textContent = new Date().toLocaleTimeString();
 }
 
@@ -814,6 +898,13 @@ function rfqCard(id, rfq) {
           </div>
           <div style="font-size:11px;color:var(--muted);margin:6px 0 4px">Leg prices:</div>
           ${legInputs}
+          <div class="row" style="margin:8px 0 4px;align-items:center;gap:8px">
+            <label style="min-width:0;font-size:11px;white-space:nowrap">Edge</label>
+            <input type="range" id="edge-${id}" min="-20" max="20" value="0" step="1"
+                   style="flex:1;accent-color:var(--accent)"
+                   oninput="applyEdge('${id}')">
+            <span id="edge-val-${id}" class="mono" style="font-size:11px;min-width:55px;text-align:right">0 ticks</span>
+          </div>
           <div class="btn-group">
             <button id="btn-sub-${id}" class="btn btn-success btn-sm" onclick="submitQuote('${id}')">Submit</button>
             <button id="btn-edt-${id}" class="btn btn-warning btn-sm" onclick="editQuote('${id}')"   disabled>Edit</button>
@@ -854,6 +945,25 @@ const OPTION_TICK_SIZE = 0.0001;
 function roundToTick(price, tick = OPTION_TICK_SIZE) {
   const decimals = Math.max(0, -Math.floor(Math.log10(tick)));
   return (Math.round(price / tick) * tick).toFixed(decimals);
+}
+
+function applyEdge(id) {
+  const slider = document.getElementById(`edge-${id}`);
+  const label  = document.getElementById(`edge-val-${id}`);
+  if (!slider) return;
+  const ticks = parseInt(slider.value);
+  S.edge[id] = ticks;
+  if (label) label.textContent = `${ticks >= 0 ? '+' : ''}${ticks} tick${Math.abs(ticks) !== 1 ? 's' : ''}`;
+
+  const rfq = S.rfqCache[id];
+  if (!rfq) return;
+  (rfq.legs || []).forEach((l, i) => {
+    if (l.fair_price == null) return;
+    const input = document.getElementById(`lp-${id}-${i}`);
+    if (!input) return;
+    const edged = l.fair_price + ticks * OPTION_TICK_SIZE;
+    input.value = roundToTick(Math.max(0, edged));
+  });
 }
 
 function collectLegs(id) {
@@ -1158,7 +1268,13 @@ async function updateRFQPrices(id) {
       // Update the quote input — skip if the user is currently typing in it
       const input = document.getElementById(`lp-${id}-${i}`);
       if (input && document.activeElement !== input) {
-        input.value       = price !== null ? fmtN(price, 4) : '';
+        const edgeTicks = S.edge[id] || 0;
+        if (price !== null) {
+          const edged = price + edgeTicks * OPTION_TICK_SIZE;
+          input.value = roundToTick(Math.max(0, edged));
+        } else {
+          input.value = '';
+        }
         input.placeholder = price !== null ? '' : 'N/A';
       }
     } catch {}
@@ -1251,6 +1367,13 @@ function connectLiveUpdates() {
 async function handleLiveUpdate(rawMsg) {
   let m;
   try { m = JSON.parse(rawMsg); } catch { return; }
+
+  // Handle rfq_quote updates — refresh My Quotes from Deribit API
+  if (m.type === 'rfq_quote') {
+    loadMyQuotes();
+    if (S.tab === 'quotes') loadQuotes();
+    return;
+  }
 
   // Handle block_rfq.maker.* and block_rfq.taker.* RFQ state updates
   if ((m.type !== 'rfq' && m.type !== 'rfq_taker') || !m.id || !m.data) return;
