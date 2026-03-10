@@ -454,9 +454,9 @@ class DeribitRfqClient:
                 # 3. Subscription data — write to all enabled sinks
                 channel = parsed.get("params", {}).get("channel", "")
                 doc = {"fetch_time": time.time_ns(), "channel": channel, "meta": _META, "message": parsed}
-                self._write_mongo(doc)
                 await self._write_redis(doc)
                 self._write_file(doc)
+                self._write_mongo(doc)
 
         except Exception as e:
             log.error(f"Message loop error: {e}")
@@ -500,13 +500,15 @@ class DeribitRfqClient:
 
             doc_json = json.dumps({k: v for k, v in doc.items() if k != "_id"})
 
+            TTL_OTHER = 4 * 3600  # 4 hours for non-rfq: channels
+
             if "block_rfq.maker.quotes." in channel:
                 # data is a list of quote objects
                 quotes = data if isinstance(data, list) else [data]
                 for q in quotes:
                     qid = q.get("block_rfq_quote_id")
                     if qid:
-                        await self._redis.set(f"rfq_quote:{qid}", doc_json)
+                        await self._redis.set(f"rfq_quote:{qid}", doc_json, ex=TTL_OTHER)
                         await self._redis.publish("rfq_updates", json.dumps({"type": "rfq_quote", "id": qid}))
                         log.info(f"[Redis] rfq_quote:{qid}")
 
@@ -518,13 +520,14 @@ class DeribitRfqClient:
                     await self._redis.set(f"rfq:{rfq_id}", doc_json)
                     await self._redis.publish("rfq_updates", json.dumps({"type": "rfq", "id": rfq_id, "data": data}))
                     log.info(f"[Redis] rfq:{rfq_id}  state={data.get('state')}")
+                    await self._cleanup_rfq_keys()
 
             elif "block_rfq.taker." in channel:
                 if not isinstance(data, dict):
                     return
                 rfq_id = data.get("block_rfq_id")
                 if rfq_id:
-                    await self._redis.set(f"rfq_taker:{rfq_id}", doc_json)
+                    await self._redis.set(f"rfq_taker:{rfq_id}", doc_json, ex=TTL_OTHER)
                     await self._redis.publish("rfq_updates", json.dumps({"type": "rfq_taker", "id": rfq_id, "data": data}))
                     log.info(f"[Redis] rfq_taker:{rfq_id}  state={data.get('state')}")
 
@@ -533,12 +536,67 @@ class DeribitRfqClient:
                     return
                 rfq_id = data.get("id") or data.get("block_rfq_id")
                 if rfq_id:
-                    await self._redis.set(f"rfq_trade:{rfq_id}", doc_json)
+                    await self._redis.set(f"rfq_trade:{rfq_id}", doc_json, ex=TTL_OTHER)
                     await self._redis.publish("rfq_updates", json.dumps({"type": "rfq_trade", "id": rfq_id}))
                     log.info(f"[Redis] rfq_trade:{rfq_id}")
 
         except Exception as e:
             log.error(f"[Redis] write failed: {e}")
+
+    async def _cleanup_rfq_keys(self):
+        """Remove outdated rfq:* keys, keeping:
+        1. All open RFQs.
+        2. Completed (non-open) RFQs within 60 minutes.
+        3. At least 10 keys total (pad with older RFQs if needed).
+        """
+        try:
+            keys = await self._redis.keys("rfq:*")
+            if not keys:
+                return
+
+            # Fetch all values in one round-trip
+            values = await self._redis.mget(keys)
+
+            now_ns = time.time_ns()
+            sixty_min_ns = 60 * 60 * 10**9
+            entries = []  # (key, fetch_time_ns, state)
+            for k, v in zip(keys, values):
+                if v is None:
+                    continue
+                try:
+                    obj = json.loads(v)
+                    ft = obj.get("fetch_time", 0)
+                    state = obj.get("message", {}).get("params", {}).get("data", {}).get("state", "")
+                    entries.append((k, ft, state))
+                except (json.JSONDecodeError, TypeError):
+                    continue
+
+            # Sort by fetch_time descending (newest first)
+            entries.sort(key=lambda e: e[1], reverse=True)
+
+            keep = set()
+            rest = []  # non-open entries outside 60 min window, newest first
+            for k, ft, state in entries:
+                if state == "open":
+                    keep.add(k)
+                elif (now_ns - ft) <= sixty_min_ns:
+                    keep.add(k)
+                else:
+                    rest.append(k)
+
+            # Ensure at least 10 keys
+            min_total = 10
+            if len(keep) < min_total:
+                for k in rest[:min_total - len(keep)]:
+                    keep.add(k)
+
+            to_delete = [k for k, _, _ in entries if k not in keep]
+            if to_delete:
+                await self._redis.delete(*to_delete)
+                log.info(f"[Redis] rfq cleanup: deleted {len(to_delete)}, kept {len(keep)}")
+
+        except Exception as e:
+            log.error(f"[Redis] rfq cleanup failed: {e}")
 
     def _write_file(self, doc: dict):
         if self._file is None:

@@ -811,7 +811,15 @@ async def get_my_quotes(request: Request):
             {"currency": "ETH"}
         )
 
-        all_quotes = btc_result + eth_result
+        # Deduplicate — Deribit may return the same quote under multiple currencies
+        seen = set()
+        all_quotes = []
+        for q in btc_result + eth_result:
+            qid = q.get("block_rfq_quote_id")
+            if qid and qid in seen:
+                continue
+            seen.add(qid)
+            all_quotes.append(q)
 
         return {
             "status": "success",

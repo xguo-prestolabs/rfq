@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(ls /Users/xguo/workspace/rfq/*.sh)",
-      "Bash(ssh:*)"
+      "Bash(ssh:*)",
+      "Bash(uv run:*)"
     ]
   }
 }
