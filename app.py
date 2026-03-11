@@ -163,17 +163,16 @@ async def lifespan(app: FastAPI):
         print(f"Deribit credentials configured at startup (testnet={testnet})")
 
     # Startup: Connect to Redis (ZMQ is handled by zmq_to_redis.py)
-    app.state.redis_client = await redis.from_url(
-        "redis://localhost:6379", decode_responses=True
-    )
-    print(f"Connected to Redis: {await app.state.redis_client.ping()}")
+    # Production uses 6379 (C++ binary writes directly); testnet uses 6380 (via zmq_to_redis.py)
+    redis_port = 6380 if testnet else 6379
+    redis_url = f"redis://localhost:{redis_port}"
+    app.state.redis_client = await redis.from_url(redis_url, decode_responses=True)
+    print(f"Connected to Redis ({redis_url}): {await app.state.redis_client.ping()}")
 
     app.state.http_session = aiohttp.ClientSession()
     print("HTTP session created for Deribit API")
 
-    app.state.broadcaster = asyncio.create_task(
-        _pubsub_broadcaster("redis://localhost:6379")
-    )
+    app.state.broadcaster = asyncio.create_task(_pubsub_broadcaster(redis_url))
     print("Redis pub/sub broadcaster started")
 
     yield
