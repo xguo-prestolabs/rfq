@@ -510,7 +510,7 @@ class DeribitRfqClient:
                     qid = q.get("block_rfq_quote_id")
                     if qid:
                         await self._redis.set(f"rfq_quote:{qid}", doc_json, ex=TTL_OTHER)
-                        await self._redis.publish("rfq_updates", json.dumps({"type": "rfq_quote", "id": qid}))
+                        await self._redis.publish("rfq_updates", json.dumps({"type": "rfq_quote", "id": qid, "testnet": self._meta["testnet"]}))
                         log.info(f"[Redis] rfq_quote:{qid}")
 
             elif "block_rfq.maker." in channel:
@@ -519,7 +519,7 @@ class DeribitRfqClient:
                 rfq_id = data.get("block_rfq_id")
                 if rfq_id:
                     await self._redis.set(f"rfq:{rfq_id}", doc_json)
-                    await self._redis.publish("rfq_updates", json.dumps({"type": "rfq", "id": rfq_id, "data": data}))
+                    await self._redis.publish("rfq_updates", json.dumps({"type": "rfq", "id": rfq_id, "data": data, "testnet": self._meta["testnet"]}))
                     log.info(f"[Redis] rfq:{rfq_id}  state={data.get('state')}")
                     await self._cleanup_rfq_keys()
 
@@ -529,7 +529,7 @@ class DeribitRfqClient:
                 rfq_id = data.get("block_rfq_id")
                 if rfq_id:
                     await self._redis.set(f"rfq_taker:{rfq_id}", doc_json, ex=TTL_OTHER)
-                    await self._redis.publish("rfq_updates", json.dumps({"type": "rfq_taker", "id": rfq_id, "data": data}))
+                    await self._redis.publish("rfq_updates", json.dumps({"type": "rfq_taker", "id": rfq_id, "data": data, "testnet": self._meta["testnet"]}))
                     log.info(f"[Redis] rfq_taker:{rfq_id}  state={data.get('state')}")
 
             elif "block_rfq.trades." in channel:
@@ -538,7 +538,7 @@ class DeribitRfqClient:
                 rfq_id = data.get("id") or data.get("block_rfq_id")
                 if rfq_id:
                     await self._redis.set(f"rfq_trade:{rfq_id}", doc_json, ex=TTL_OTHER)
-                    await self._redis.publish("rfq_updates", json.dumps({"type": "rfq_trade", "id": rfq_id}))
+                    await self._redis.publish("rfq_updates", json.dumps({"type": "rfq_trade", "id": rfq_id, "testnet": self._meta["testnet"]}))
                     log.info(f"[Redis] rfq_trade:{rfq_id}")
 
         except Exception as e:

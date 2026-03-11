@@ -106,6 +106,10 @@ async def _pubsub_broadcaster(redis_url: str):
                 _pubsub_last_msg_at = time.time()
                 try:
                     meta = json.loads(payload)
+                    # Filter out messages from the wrong environment
+                    msg_testnet = meta.get("testnet")
+                    if msg_testnet is not None and msg_testnet != deribit_config.testnet:
+                        continue
                     print(f"[pubsub] rfq_updates → type={meta.get('type')} id={meta.get('id')} state={meta.get('data', {}).get('state', '—')} clients={len(_ws_clients)}")
                 except Exception:
                     print(f"[pubsub] rfq_updates → (unparseable) clients={len(_ws_clients)}")
@@ -349,10 +353,15 @@ async def get_rfqs(request: Request):
     if keys:
         values = await request.app.state.redis_client.mget(keys)
         t2 = time.perf_counter()
+        is_testnet = deribit_config.testnet
         for key, value in zip(keys, values):
             if value:
-                rfq_id = int(key.split(":", 1)[1])
                 doc = json.loads(value)
+                # Filter out messages that don't match the current environment
+                doc_testnet = doc.get("meta", {}).get("testnet")
+                if doc_testnet is not None and doc_testnet != is_testnet:
+                    continue
+                rfq_id = int(key.split(":", 1)[1])
                 results[rfq_id] = doc.get("message", {}).get("params", {}).get("data", doc)
     else:
         t2 = time.perf_counter()
@@ -360,7 +369,7 @@ async def get_rfqs(request: Request):
     _stats["GET /rfqs — KEYS rfq:*"].record(keys_ms)
     _stats["GET /rfqs — MGET"].record(mget_ms)
     _stats["GET /rfqs — total"].record(keys_ms + mget_ms)
-    print(f"[Redis] KEYS rfq:* ({len(keys)} keys) — {keys_ms:.1f} ms | MGET — {mget_ms:.1f} ms | total — {keys_ms+mget_ms:.1f} ms")
+    print(f"[Redis] KEYS rfq:* ({len(keys)} keys, {len(results)} matched) — {keys_ms:.1f} ms | MGET — {mget_ms:.1f} ms | total — {keys_ms+mget_ms:.1f} ms")
     return results
 
 
@@ -633,6 +642,8 @@ async def add_quote(quote: QuoteRequest, request: Request):
     if quote.hedge is not None:
         params["hedge"] = quote.hedge
 
+    redis_client = request.app.state.redis_client
+    ts = time.time_ns()
     try:
         result = await call_deribit_api(
             session,
@@ -645,8 +656,7 @@ async def add_quote(quote: QuoteRequest, request: Request):
         # Store in Redis for 48 hours
         qid = result.get("block_rfq_quote_id") or result.get("quote_id")
         if qid:
-            redis_client = request.app.state.redis_client
-            record = {"timestamp": time.time_ns(), "action": "submit", "params": params, "result": result}
+            record = {"timestamp": ts, "action": "submit", "status": "success", "params": params, "result": result}
             await redis_client.set(f"rfq_user:submit:{qid}", json.dumps(record, default=str), ex=48 * 3600)
 
         return {
@@ -659,8 +669,12 @@ async def add_quote(quote: QuoteRequest, request: Request):
         }
 
     except HTTPException as e:
+        record = {"timestamp": ts, "action": "submit", "status": "error", "params": params, "error": e.detail}
+        await redis_client.set(f"rfq_user:submit:err:{ts}", json.dumps(record, default=str), ex=48 * 3600)
         raise e
     except Exception as e:
+        record = {"timestamp": ts, "action": "submit", "status": "error", "params": params, "error": str(e)}
+        await redis_client.set(f"rfq_user:submit:err:{ts}", json.dumps(record, default=str), ex=48 * 3600)
         raise HTTPException(
             status_code=500,
             detail=f"Failed to add quote: {str(e)}"
@@ -683,6 +697,8 @@ async def cancel_quote(cancel_req: CancelQuoteRequest, request: Request):
         "block_rfq_quote_id": cancel_req.quote_id
     }
 
+    redis_client = request.app.state.redis_client
+    ts = time.time_ns()
     try:
         result = await call_deribit_api(
             session,
@@ -693,8 +709,7 @@ async def cancel_quote(cancel_req: CancelQuoteRequest, request: Request):
         print(f"Quote canceled successfully: {result}")
 
         # Store in Redis for 48 hours
-        redis_client = request.app.state.redis_client
-        record = {"timestamp": time.time_ns(), "action": "cancel", "params": params, "result": result}
+        record = {"timestamp": ts, "action": "cancel", "status": "success", "params": params, "result": result}
         await redis_client.set(f"rfq_user:cancel:{cancel_req.quote_id}", json.dumps(record, default=str), ex=48 * 3600)
 
         return {
@@ -704,8 +719,12 @@ async def cancel_quote(cancel_req: CancelQuoteRequest, request: Request):
         }
 
     except HTTPException as e:
+        record = {"timestamp": ts, "action": "cancel", "status": "error", "params": params, "error": e.detail}
+        await redis_client.set(f"rfq_user:cancel:err:{ts}", json.dumps(record, default=str), ex=48 * 3600)
         raise e
     except Exception as e:
+        record = {"timestamp": ts, "action": "cancel", "status": "error", "params": params, "error": str(e)}
+        await redis_client.set(f"rfq_user:cancel:err:{ts}", json.dumps(record, default=str), ex=48 * 3600)
         raise HTTPException(
             status_code=500,
             detail=f"Failed to cancel quote: {str(e)}"
@@ -736,6 +755,8 @@ async def edit_quote(edit_req: EditQuoteRequest, request: Request):
     if edit_req.hedge is not None:
         params["hedge"] = edit_req.hedge
 
+    redis_client = request.app.state.redis_client
+    ts = time.time_ns()
     try:
         result = await call_deribit_api(
             session,
@@ -746,8 +767,7 @@ async def edit_quote(edit_req: EditQuoteRequest, request: Request):
         print(f"Quote edited successfully: {result}")
 
         # Store in Redis for 48 hours
-        redis_client = request.app.state.redis_client
-        record = {"timestamp": time.time_ns(), "action": "edit", "params": params, "result": result}
+        record = {"timestamp": ts, "action": "edit", "status": "success", "params": params, "result": result}
         await redis_client.set(f"rfq_user:edit:{edit_req.quote_id}", json.dumps(record, default=str), ex=48 * 3600)
 
         return {
@@ -759,8 +779,12 @@ async def edit_quote(edit_req: EditQuoteRequest, request: Request):
         }
 
     except HTTPException as e:
+        record = {"timestamp": ts, "action": "edit", "status": "error", "params": params, "error": e.detail}
+        await redis_client.set(f"rfq_user:edit:err:{ts}", json.dumps(record, default=str), ex=48 * 3600)
         raise e
     except Exception as e:
+        record = {"timestamp": ts, "action": "edit", "status": "error", "params": params, "error": str(e)}
+        await redis_client.set(f"rfq_user:edit:err:{ts}", json.dumps(record, default=str), ex=48 * 3600)
         raise HTTPException(
             status_code=500,
             detail=f"Failed to edit quote: {str(e)}"
@@ -805,8 +829,18 @@ async def cancel_all_quotes(cancel_all_req: CancelAllQuotesRequest, request: Req
         }
 
     except HTTPException as e:
+        redis_client = request.app.state.redis_client
+        ts = time.time_ns()
+        currency = cancel_all_req.currency or "all"
+        record = {"timestamp": ts, "action": "cancel_all", "status": "error", "currency": currency, "params": params, "error": e.detail}
+        await redis_client.set(f"rfq_user:cancel_all:err:{ts}", json.dumps(record, default=str), ex=48 * 3600)
         raise e
     except Exception as e:
+        redis_client = request.app.state.redis_client
+        ts = time.time_ns()
+        currency = cancel_all_req.currency or "all"
+        record = {"timestamp": ts, "action": "cancel_all", "status": "error", "currency": currency, "params": params, "error": str(e)}
+        await redis_client.set(f"rfq_user:cancel_all:err:{ts}", json.dumps(record, default=str), ex=48 * 3600)
         raise HTTPException(
             status_code=500,
             detail=f"Failed to cancel all quotes: {str(e)}"

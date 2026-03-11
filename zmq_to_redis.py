@@ -7,7 +7,15 @@ import zmq.asyncio
 import redis.asyncio as redis
 
 ZMQ_URL = "tcp://localhost:40000"
-REDIS_URL = "redis://localhost:6379"
+REDIS_URL = "redis://localhost:6380"
+
+# Redis port layout:
+#   6379 (production) — C++ binary writes price/greeks data directly here (C++ binary keeps the old zmq publish interface in 40000 for now)
+#   6380 (testnet)    — this script bridges ZMQ → Redis for testnet use
+#
+# Data flow:
+#   Production: C++ binary → Redis 6379 → app.py / ws_client_redis.py
+#   Testnet:    C++ binary → ZMQ :40000 → zmq_to_redis.py → Redis 6380 → app.py
 
 
 async def run() -> None:

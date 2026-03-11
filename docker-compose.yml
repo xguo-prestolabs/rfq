@@ -3,6 +3,6 @@ services:
     build: .
     working_dir: /app
     env_file:
-      - .env.testnet
+      - .env.prod
     network_mode: host
     restart: unless-stopped
