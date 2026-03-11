@@ -481,65 +481,54 @@ tbody td { padding: 6px 10px; vertical-align: middle; }
 
         <h2>2. Per-Leg Dollar Greeks (RFQ Cards)</h2>
         <p>
-          Each RFQ card shows per-leg dollar greeks derived from the raw (unit) greeks
-          returned by <code>/greeks/{instrument}</code> and the underlying index price \(S\).
-        </p>
-        <p>
-          The raw greeks from the C++ pricer are <em>per 1 coin of the underlying</em>:
+          Each RFQ card shows per-leg dollar greeks for the full RFQ amount. The raw greeks
+          from the C++ pricer (<code>/greeks/{instrument}</code>) are already in dollar terms
+          per 1 coin of the underlying:
         </p>
         <ul>
-          <li>\(\delta\) — option delta (dimensionless, range roughly &minus;1 to +1)</li>
-          <li>\(\gamma\) — option gamma (second derivative of price w.r.t. underlying)</li>
-          <li>\(\nu\) — option vega (Black vega, already denominated in USD)</li>
+          <li>\(\delta_{\$}\) — dollar delta per coin</li>
+          <li>\(\gamma_{\$}\) — dollar gamma per coin</li>
+          <li>\(\nu_{\$}\) — dollar vega per coin</li>
         </ul>
+        <p>
+          To get the total dollar greek exposure for the RFQ, each is multiplied by the
+          RFQ amount \(Q\):
+        </p>
 
         <h3>2.1 Dollar Delta</h3>
         <p>
-          Dollar Delta measures the P&amp;L impact (in USD) of a <strong>$1 move</strong> in the
-          underlying spot price. It converts the dimensionless delta into a dollar amount:
+          Total P&amp;L impact (in USD) of a $1 move in the underlying for the full RFQ:
         </p>
         \[
-          \Delta_{\$} = \delta \times S
+          \Delta_{\text{total}} = \delta_{\$} \times Q
         \]
         <p>
-          where \(S\) is the current index price (e.g. <code>btc_usd</code> or <code>eth_usd</code>).
-        </p>
-        <p>
-          <em>Example:</em> If \(\delta = 0.55\) and \(S = 70{,}000\), then
-          \(\Delta_{\$} = 0.55 \times 70{,}000 = 38{,}500\). A $1 increase in BTC
-          changes the position value by $38,500.
+          <em>Example:</em> If \(\delta_{\$} = 38{,}500\) per coin and \(Q = 25\), then
+          \(\Delta_{\text{total}} = 38{,}500 \times 25 = 962{,}500\).
         </p>
 
         <h3>2.2 Dollar Gamma</h3>
         <p>
-          Dollar Gamma measures how much <strong>Dollar Delta changes</strong> when the underlying
-          moves by <strong>1%</strong>:
+          Change in Dollar Delta for a 1% move in the underlying, for the full RFQ:
         </p>
         \[
-          \Gamma_{\$} = \gamma \times S^2 \times 0.01
+          \Gamma_{\text{total}} = \gamma_{\$} \times Q
         \]
         <p>
-          The \(S^2\) factor converts gamma from "per coin²" units to dollar terms, and the
-          \(0.01\) factor scales it to a 1% move.
-        </p>
-        <p>
-          <em>Example:</em> If \(\gamma = 0.00002\) and \(S = 70{,}000\), then
-          \(\Gamma_{\$} = 0.00002 \times 70{,}000^2 \times 0.01 = 980\). A 1% move in BTC
-          changes Dollar Delta by $980.
+          <em>Example:</em> If \(\gamma_{\$} = 980\) per coin and \(Q = 25\), then
+          \(\Gamma_{\text{total}} = 980 \times 25 = 24{,}500\).
         </p>
 
         <h3>2.3 Dollar Vega</h3>
         <p>
-          Dollar Vega measures the P&amp;L impact of a <strong>1-point change</strong> in implied
-          volatility. The vega returned by the C++ pricer (Black vega) is already in USD,
-          so no conversion is needed:
+          P&amp;L impact of a 1-point IV change, for the full RFQ:
         </p>
         \[
-          \mathcal{V}_{\$} = \nu
+          \mathcal{V}_{\text{total}} = \nu_{\$} \times Q
         \]
         <p>
-          <em>Example:</em> If \(\nu = 120\), then a 1-point increase in IV (e.g. 50% → 51%)
-          changes the position value by $120.
+          <em>Example:</em> If \(\nu_{\$} = 120\) per coin and \(Q = 25\), then
+          \(\mathcal{V}_{\text{total}} = 120 \times 25 = 3{,}000\).
         </p>
 
         <h3>2.4 Combo (Multi-Leg) Aggregation</h3>
@@ -552,11 +541,11 @@ tbody td { padding: 6px 10px; vertical-align: middle; }
         \]
         <p>
           where \(r_i = \text{ratio}_i \times s_i\), with \(s_i = +1\) for buy and \(s_i = -1\) for sell,
-          and \(G_i\) is any of \(\Delta_{\$}, \Gamma_{\$}, \mathcal{V}_{\$}\) for leg \(i\).
+          and \(G_i\) is any of \(\Delta_{\text{total}}, \Gamma_{\text{total}}, \mathcal{V}_{\text{total}}\) for leg \(i\).
         </p>
         <p>
-          <em>Example (straddle):</em> Buy 1× 70000-C (\(\Delta_{\$} = 38{,}500\)) and buy 1× 70000-P
-          (\(\Delta_{\$} = -31{,}500\)). Combo \(\Delta_{\$} = 38{,}500 + (-31{,}500) = 7{,}000\).
+          <em>Example (straddle, Q=25):</em> Buy 1× 70000-C (\(\Delta = 962{,}500\)) and buy 1× 70000-P
+          (\(\Delta = -787{,}500\)). Combo \(\Delta = 962{,}500 + (-787{,}500) = 175{,}000\).
         </p>
 
         <h2>3. Edge Parameter</h2>
@@ -799,21 +788,23 @@ async function enrichRFQ(id, rfq) {
   return { id, rfq: { ...rfq, legs } };
 }
 
-function toDollarGreeks(leg, idx) {
-  leg.delta = leg._delta * idx;
-  leg.gamma = leg._gamma * idx * idx * 0.01;
-  leg.vega  = leg._vega;  // vega from blackVega is already in dollar terms
+function toDollarGreeks(leg, amount) {
+  // Greeks from the C++ pricer are already in dollar terms per 1 coin.
+  // Multiply by the RFQ amount to get total dollar exposure.
+  leg.delta = leg._delta * amount;
+  leg.gamma = leg._gamma * amount;
+  leg.vega  = leg._vega  * amount;
 }
 
 function combo(rfq) {
-  const idx = Object.values(rfq.index_prices || {})[0] || 1;
+  const amount = rfq.amount || 1;
   const c = { instrument_name: rfq.combo_id || 'COMBO', direction: '—', ratio: '—', fair_price: null, delta: 0, gamma: 0, vega: 0 };
   let priceSum = 0, allPrices = true;
   for (const l of rfq.legs || []) {
     const s = l.direction === 'buy' ? 1 : -1, r = (l.ratio || 1) * s;
     if (l.fair_price === null || l.fair_price === undefined) { allPrices = false; }
     else { priceSum += l.fair_price * r; }
-    toDollarGreeks(l, idx);
+    toDollarGreeks(l, amount);
     c.delta += (l.delta || 0) * r;
     c.gamma += (l.gamma || 0) * r;
     c.vega  += (l.vega  || 0) * r;

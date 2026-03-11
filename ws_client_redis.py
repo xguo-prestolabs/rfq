@@ -175,6 +175,7 @@ class DeribitRfqClient:
         self._id_prefix   = f"rfq_{id(self)}"
         self._pending: Dict[str, asyncio.Future] = {}
         self._last_msg_at: float = 0.0   # monotonic timestamp of last received frame
+        self._meta = {**_META, "testnet": "test.deribit.com" in config.get("server", "")}
 
         # MongoDB (sync pymongo — blocking calls are acceptable here because they
         # run in the message loop which has no other concurrent awaits at that point)
@@ -453,7 +454,7 @@ class DeribitRfqClient:
 
                 # 3. Subscription data — write to all enabled sinks
                 channel = parsed.get("params", {}).get("channel", "")
-                doc = {"fetch_time": time.time_ns(), "channel": channel, "meta": _META, "message": parsed}
+                doc = {"fetch_time": time.time_ns(), "channel": channel, "meta": self._meta, "message": parsed}
                 await self._write_redis(doc)
                 self._write_file(doc)
                 self._write_mongo(doc)
