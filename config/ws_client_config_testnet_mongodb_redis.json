@@ -30,7 +30,7 @@
   },
   "redis": {
     "enabled": true,
-    "url": "redis://localhost:6379"
+    "url": "redis://localhost:6380"
   },
   "local_file": {
     "enabled": true,
