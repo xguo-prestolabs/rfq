@@ -80,7 +80,7 @@ from pymongo import MongoClient
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s %(levelname)-5s [%(filename)s:%(lineno)d] %(message)s",
 )
 log = logging.getLogger(__name__)
 
@@ -228,7 +228,7 @@ class DeribitRfqClient:
                 log.info("Cancelled — shutting down")
                 return
             except Exception as e:
-                log.error(f"Connection lost: {type(e).__name__}: {e}")
+                log.error(f"Connection lost: {type(e).__name__}: {e}", exc_info=True)
 
             # Reset backoff if this session was stable long enough
             elapsed = time.monotonic() - t_start
@@ -249,7 +249,11 @@ class DeribitRfqClient:
         ssl_ctx = None
         if url.startswith("wss://"):
             ssl_ctx = ssl.create_default_context()
-            ssl_ctx.load_verify_locations(certifi.where())
+            cert_path = certifi.where()
+            if not pathlib.Path(cert_path).exists():
+                log.error(f"SSL certificate file not found: {cert_path}")
+                raise FileNotFoundError(f"SSL certificate file not found: {cert_path}")
+            ssl_ctx.load_verify_locations(cert_path)
 
         # Open Redis for this session
         if self._redis_url:

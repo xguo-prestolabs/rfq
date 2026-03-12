@@ -177,6 +177,71 @@ class RedisSubscriber:
             await self.handler.on_trade(msg_id)
 
 
+# ─── ZMQ Subscriber ────────────────────────────────────────────────────────
+
+
+class PriceHandler(Protocol):
+    """Protocol for handling price updates from ZMQ."""
+
+    def on_price(self, instrument: str, price: float) -> None:
+        """Called when a fair price update is received."""
+        ...
+
+
+class ZmqSubscriber:
+    """Subscribes to ZMQ PUB socket and dispatches price updates to a handler."""
+
+    def __init__(self, zmq_url: str, handler: PriceHandler):
+        self.zmq_url = zmq_url
+        self.handler = handler
+        self._context: zmq.asyncio.Context | None = None
+        self._socket: zmq.asyncio.Socket | None = None
+
+    async def start(self) -> None:
+        """Connect to ZMQ PUB socket."""
+        self._context = zmq.asyncio.Context()
+        self._socket = self._context.socket(zmq.SUB)
+        self._socket.connect(self.zmq_url)
+        self._socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        log.info(f"ZmqSubscriber connected to {self.zmq_url}")
+
+    async def stop(self) -> None:
+        """Close the ZMQ connection."""
+        if self._socket:
+            self._socket.close()
+            self._socket = None
+        if self._context:
+            self._context.term()
+            self._context = None
+
+    async def run(self) -> None:
+        """Subscribe and dispatch messages to handler. Call start() first."""
+        if not self._socket:
+            raise RuntimeError("ZmqSubscriber not started. Call start() first.")
+
+        try:
+            while True:
+                msg = await self._socket.recv_string()
+                try:
+                    data = json.loads(msg)
+                    self._dispatch(data)
+                except json.JSONDecodeError:
+                    pass
+                except Exception as e:
+                    log.error(f"ZMQ message error: {e}")
+        except asyncio.CancelledError:
+            pass
+
+    def _dispatch(self, data: dict) -> None:
+        """Route a message to the appropriate handler method."""
+        msg_type = data.get("msg_type")
+        if msg_type == "fair_price":
+            instrument = data.get("native_product")
+            price = data.get("strat_mid_price")
+            if instrument and price is not None:
+                self.handler.on_price(instrument, price)
+
+
 # ─── Quote state ───────────────────────────────────────────────────────────
 
 
@@ -219,7 +284,6 @@ class MMBot:
 
         self.contexts: dict[int, RFQContext] = {}  # rfq_id -> RFQContext
         self._session: aiohttp.ClientSession | None = None
-        self._redis: aioredis.Redis | None = None
 
         # Price cache populated by ZMQ subscriber
         self._price_cache: dict[str, float] = {}  # instrument_name -> fair_price
@@ -247,7 +311,11 @@ class MMBot:
             log.error(f"POST {path} failed: {e}")
         return None
 
-    # ── Price cache (from ZMQ) ────────────────────────────────────────
+    # ── Price handling (PriceHandler protocol) ─────────────────────────
+
+    def on_price(self, instrument: str, price: float) -> None:
+        """Called when a fair price update is received from ZMQ."""
+        self._price_cache[instrument] = price
 
     def _get_leg_prices(self, legs: list) -> dict:
         """Get fair prices for all legs from local cache. Returns {instrument_name: price_or_None}."""
@@ -256,36 +324,6 @@ class MMBot:
             inst = leg["instrument_name"]
             prices[inst] = self._price_cache.get(inst)
         return prices
-
-    async def _zmq_price_loop(self):
-        """Subscribe to ZMQ and cache fair prices locally."""
-        context = zmq.asyncio.Context()
-        socket = context.socket(zmq.SUB)
-        socket.connect(self.zmq_url)
-        socket.setsockopt_string(zmq.SUBSCRIBE, "")
-        log.info(f"ZMQ subscriber connected to {self.zmq_url}")
-
-        try:
-            while True:
-                msg = await socket.recv_string()
-                try:
-                    data = json.loads(msg)
-                    msg_type = data.get("msg_type")
-                    if msg_type == "fair_price":
-                        native_product = data.get("native_product")
-                        price = data.get("strat_mid_price")
-                        if native_product and price is not None:
-                            self._price_cache[native_product] = price
-                except json.JSONDecodeError:
-                    pass
-                except Exception as e:
-                    log.error(f"ZMQ message error: {e}")
-        except asyncio.CancelledError:
-            pass
-        finally:
-            socket.close()
-            context.term()
-            log.info("ZMQ subscriber stopped")
 
     # ── Quote logic ───────────────────────────────────────────────────
 
@@ -522,41 +560,42 @@ class MMBot:
         open_rfqs = {int(k): v for k, v in data.items() if v.get("state") == "open"}
         log.info(f"Bootstrap: {len(open_rfqs)} open RFQs")
         for rfq_id, rfq_data in open_rfqs.items():
-            await self.handle_new_rfq(rfq_id, rfq_data)
+            await self.on_new_rfq(rfq_id, rfq_data)
 
     # ── Main ──────────────────────────────────────────────────────────
 
     async def run(self):
         self._session = aiohttp.ClientSession()
-        self._redis = await aioredis.from_url(self.redis_url, decode_responses=True)
 
         log.info(f"mmbot started: api={self.api_url} redis={self.redis_url} "
                  f"zmq={self.zmq_url} edge={self.edge_ticks} threshold={self.threshold_ticks} "
                  f"cooldown={self.cooldown}s amount_frac={self.amount_frac} "
                  f"dry_run={self.dry_run}")
 
-        # Start ZMQ price subscriber as a background task
-        zmq_task = asyncio.create_task(self._zmq_price_loop())
+        # Set up ZMQ subscriber for price updates
+        zmq_sub = ZmqSubscriber(self.zmq_url, self)
+        await zmq_sub.start()
 
-        # Wait a moment for initial prices to populate
+        # Start ZMQ subscriber as background task and wait for initial prices
+        zmq_task = asyncio.create_task(zmq_sub.run())
         await asyncio.sleep(1.0)
         log.info(f"Price cache initialized with {len(self._price_cache)} instruments")
+
+        # Set up Redis subscriber for RFQ events
+        redis_sub = RedisSubscriber(self.redis_url, "rfq_updates", self)
+        await redis_sub.start()
 
         try:
             await self._bootstrap()
             await asyncio.gather(
-                self._pubsub_loop(),
+                zmq_task,
+                redis_sub.run(),
                 self._price_refresh_loop(),
             )
         except asyncio.CancelledError:
             pass
         finally:
             log.info("Shutting down...")
-            zmq_task.cancel()
-            try:
-                await zmq_task
-            except asyncio.CancelledError:
-                pass
             # Cancel all active quotes on shutdown
             for ctx in self.contexts.values():
                 if ctx.buy_quote:
@@ -565,7 +604,8 @@ class MMBot:
                     await self._cancel_quote(ctx.sell_quote)
             self.contexts.clear()
             await self._session.close()
-            await self._redis.close()
+            await zmq_sub.stop()
+            await redis_sub.stop()
             log.info("mmbot stopped")
 
 
