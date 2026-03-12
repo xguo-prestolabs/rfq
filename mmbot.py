@@ -183,7 +183,7 @@ class RedisSubscriber:
 class PriceHandler(Protocol):
     """Protocol for handling price updates from ZMQ."""
 
-    def on_price(self, instrument: str, price: float) -> None:
+    async def on_price(self, instrument: str, price: float) -> None:
         """Called when a fair price update is received."""
         ...
 
@@ -224,7 +224,7 @@ class ZmqSubscriber:
                 msg = await self._socket.recv_string()
                 try:
                     data = json.loads(msg)
-                    self._dispatch(data)
+                    await self._dispatch(data)
                 except json.JSONDecodeError:
                     pass
                 except Exception as e:
@@ -232,14 +232,14 @@ class ZmqSubscriber:
         except asyncio.CancelledError:
             pass
 
-    def _dispatch(self, data: dict) -> None:
+    async def _dispatch(self, data: dict) -> None:
         """Route a message to the appropriate handler method."""
         msg_type = data.get("msg_type")
         if msg_type == "fair_price":
             instrument = data.get("native_product")
             price = data.get("strat_mid_price")
             if instrument and price is not None:
-                self.handler.on_price(instrument, price)
+                await self.handler.on_price(instrument, price)
 
 
 # ─── Quote state ───────────────────────────────────────────────────────────
@@ -313,9 +313,38 @@ class MMBot:
 
     # ── Price handling (PriceHandler protocol) ─────────────────────────
 
-    def on_price(self, instrument: str, price: float) -> None:
-        """Called when a fair price update is received from ZMQ."""
+    async def on_price(self, instrument: str, price: float) -> None:
+        """Called when a fair price update is received from ZMQ.
+        
+        Updates the cache and checks all active contexts that use this instrument,
+        editing quotes if the price changed beyond the threshold.
+        """
         self._price_cache[instrument] = price
+
+        # Find all contexts that have this instrument in their legs
+        for ctx in list(self.contexts.values()):
+            leg_instruments = {leg["instrument_name"] for leg in ctx.rfq_data.get("legs", [])}
+            if instrument not in leg_instruments:
+                continue
+
+            # Get all leg prices - skip if any are missing
+            prices = self._get_leg_prices(ctx.rfq_data["legs"])
+            if any(p is None for p in prices.values()):
+                continue
+
+            # Check and edit buy quote
+            if ctx.buy_quote and self._cooldown_ok(ctx.buy_quote):
+                new_legs = self._build_legs(ctx.rfq_data["legs"], prices, "buy")
+                if new_legs and self._price_changed(ctx.buy_quote.legs, new_legs):
+                    await self._edit_quote(ctx.buy_quote, new_legs)
+
+            # Check and edit sell quote
+            if ctx.sell_quote and self._cooldown_ok(ctx.sell_quote):
+                new_legs = self._build_legs(ctx.rfq_data["legs"], prices, "sell")
+                if new_legs and self._price_changed(ctx.sell_quote.legs, new_legs):
+                    await self._edit_quote(ctx.sell_quote, new_legs)
+
+            ctx.last_prices = prices
 
     def _get_leg_prices(self, legs: list) -> dict:
         """Get fair prices for all legs from local cache. Returns {instrument_name: price_or_None}."""
@@ -515,8 +544,8 @@ class MMBot:
 
     # ── Price refresh loop ────────────────────────────────────────────
 
-    async def _price_refresh_loop(self):
-        """Periodically check prices and edit quotes if needed."""
+    async def _expiry_check_loop(self):
+        """Periodically check for expired RFQs and clean up contexts."""
         while True:
             await asyncio.sleep(1.0)
             for rfq_id, ctx in list(self.contexts.items()):
@@ -527,27 +556,9 @@ class MMBot:
                     del self.contexts[rfq_id]
                     continue
 
+                # Remove context if no active quotes
                 if not ctx.buy_quote and not ctx.sell_quote:
                     del self.contexts[rfq_id]
-                    continue
-
-                prices = self._get_leg_prices(ctx.rfq_data["legs"])
-                if any(p is None for p in prices.values()):
-                    continue
-
-                # Check and edit buy quote
-                if ctx.buy_quote and self._cooldown_ok(ctx.buy_quote):
-                    new_legs = self._build_legs(ctx.rfq_data["legs"], prices, "buy")
-                    if new_legs and self._price_changed(ctx.buy_quote.legs, new_legs):
-                        await self._edit_quote(ctx.buy_quote, new_legs)
-
-                # Check and edit sell quote
-                if ctx.sell_quote and self._cooldown_ok(ctx.sell_quote):
-                    new_legs = self._build_legs(ctx.rfq_data["legs"], prices, "sell")
-                    if new_legs and self._price_changed(ctx.sell_quote.legs, new_legs):
-                        await self._edit_quote(ctx.sell_quote, new_legs)
-
-                ctx.last_prices = prices
 
     # ── Bootstrap: quote existing open RFQs ───────────────────────────
 
@@ -590,7 +601,7 @@ class MMBot:
             await asyncio.gather(
                 zmq_task,
                 redis_sub.run(),
-                self._price_refresh_loop(),
+                self._expiry_check_loop(),
             )
         except asyncio.CancelledError:
             pass
