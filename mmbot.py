@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)-5s %(message)s",
+    format="%(asctime)s %(levelname)-5s [%(filename)s:%(lineno)d] %(message)s",
     stream=sys.stderr,
 )
 log = logging.getLogger("mmbot")
