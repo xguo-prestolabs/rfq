@@ -3,8 +3,8 @@
 RFQ Market-Maker Bot (mmbot)
 
 A simple automated RFQ quoter that:
-1. Listens for new RFQs via Redis pub/sub (`rfq_updates` channel)
-2. Fetches fair prices from app.py for each leg
+1. Subscribes to ZMQ for real-time fair prices from C++ binary
+2. Listens for new RFQs via Redis pub/sub (`rfq_updates` channel)
 3. Submits two-sided quotes (buy + sell) with a configurable edge
 4. Edits quotes when fair prices change beyond a threshold
 5. Cleans up quotes when RFQs expire or quotes are filled/cancelled
@@ -25,6 +25,7 @@ from pathlib import Path
 
 import aiohttp
 import redis.asyncio as aioredis
+import zmq.asyncio
 from pydantic import BaseModel, Field
 
 logging.basicConfig(
@@ -51,6 +52,10 @@ class MMBotConfig(BaseModel):
     redis_url: str = Field(
         default="redis://localhost:6379",
         description="Redis connection URL",
+    )
+    zmq_url: str = Field(
+        default="tcp://localhost:40000",
+        description="ZMQ PUB socket URL for price/greeks data from C++ binary",
     )
     edge_ticks: int = Field(
         default=3,
@@ -118,6 +123,7 @@ class MMBot:
         self.config = config
         self.api_url = config.api_url.rstrip("/")
         self.redis_url = config.redis_url
+        self.zmq_url = config.zmq_url
         self.edge_ticks = config.edge_ticks
         self.threshold_ticks = config.threshold_ticks
         self.cooldown = config.cooldown
@@ -127,6 +133,9 @@ class MMBot:
         self.contexts: dict[int, RFQContext] = {}  # rfq_id -> RFQContext
         self._session: aiohttp.ClientSession | None = None
         self._redis: aioredis.Redis | None = None
+
+        # Price cache populated by ZMQ subscriber
+        self._price_cache: dict[str, float] = {}  # instrument_name -> fair_price
 
     # ── HTTP helpers ──────────────────────────────────────────────────
 
@@ -151,16 +160,45 @@ class MMBot:
             log.error(f"POST {path} failed: {e}")
         return None
 
-    # ── Price fetching ────────────────────────────────────────────────
+    # ── Price cache (from ZMQ) ────────────────────────────────────────
 
-    async def _fetch_leg_prices(self, legs: list) -> dict:
-        """Fetch fair prices for all legs. Returns {instrument_name: price_or_None}."""
+    def _get_leg_prices(self, legs: list) -> dict:
+        """Get fair prices for all legs from local cache. Returns {instrument_name: price_or_None}."""
         prices = {}
         for leg in legs:
             inst = leg["instrument_name"]
-            data = await self._get(f"/price/{inst}")
-            prices[inst] = data.get("price") if data else None
+            prices[inst] = self._price_cache.get(inst)
         return prices
+
+    async def _zmq_price_loop(self):
+        """Subscribe to ZMQ and cache fair prices locally."""
+        context = zmq.asyncio.Context()
+        socket = context.socket(zmq.SUB)
+        socket.connect(self.zmq_url)
+        socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        log.info(f"ZMQ subscriber connected to {self.zmq_url}")
+
+        try:
+            while True:
+                msg = await socket.recv_string()
+                try:
+                    data = json.loads(msg)
+                    msg_type = data.get("msg_type")
+                    if msg_type == "fair_price":
+                        native_product = data.get("native_product")
+                        price = data.get("strat_mid_price")
+                        if native_product and price is not None:
+                            self._price_cache[native_product] = price
+                except json.JSONDecodeError:
+                    pass
+                except Exception as e:
+                    log.error(f"ZMQ message error: {e}")
+        except asyncio.CancelledError:
+            pass
+        finally:
+            socket.close()
+            context.term()
+            log.info("ZMQ subscriber stopped")
 
     # ── Quote logic ───────────────────────────────────────────────────
 
@@ -290,7 +328,7 @@ class MMBot:
         ctx = RFQContext(rfq_id=rfq_id, rfq_data=rfq_data)
         self.contexts[rfq_id] = ctx
 
-        prices = await self._fetch_leg_prices(rfq_data["legs"])
+        prices = self._get_leg_prices(rfq_data["legs"])
         if any(p is None for p in prices.values()):
             log.warning(f"Missing prices for rfq={rfq_id}, skipping: {prices}")
             del self.contexts[rfq_id]
@@ -362,7 +400,7 @@ class MMBot:
                     del self.contexts[rfq_id]
                     continue
 
-                prices = await self._fetch_leg_prices(ctx.rfq_data["legs"])
+                prices = self._get_leg_prices(ctx.rfq_data["legs"])
                 if any(p is None for p in prices.values()):
                     continue
 
@@ -437,9 +475,16 @@ class MMBot:
         self._redis = await aioredis.from_url(self.redis_url, decode_responses=True)
 
         log.info(f"mmbot started: api={self.api_url} redis={self.redis_url} "
-                 f"edge={self.edge_ticks} threshold={self.threshold_ticks} "
+                 f"zmq={self.zmq_url} edge={self.edge_ticks} threshold={self.threshold_ticks} "
                  f"cooldown={self.cooldown}s amount_frac={self.amount_frac} "
                  f"dry_run={self.dry_run}")
+
+        # Start ZMQ price subscriber as a background task
+        zmq_task = asyncio.create_task(self._zmq_price_loop())
+
+        # Wait a moment for initial prices to populate
+        await asyncio.sleep(1.0)
+        log.info(f"Price cache initialized with {len(self._price_cache)} instruments")
 
         try:
             await self._bootstrap()
@@ -451,6 +496,11 @@ class MMBot:
             pass
         finally:
             log.info("Shutting down...")
+            zmq_task.cancel()
+            try:
+                await zmq_task
+            except asyncio.CancelledError:
+                pass
             # Cancel all active quotes on shutdown
             for ctx in self.contexts.values():
                 if ctx.buy_quote:
