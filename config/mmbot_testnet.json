@@ -1,0 +1,10 @@
+{
+  "api_url": "http://localhost:8001",
+  "redis_url": "redis://localhost:6380",
+  "zmq_url": "tcp://localhost:40000",
+  "edge_ticks": 3,
+  "threshold_ticks": 1,
+  "cooldown": 1.0,
+  "amount_frac": 1.0,
+  "dry_run": false
+}

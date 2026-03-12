@@ -22,6 +22,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Protocol
 
 import aiohttp
 import redis.asyncio as aioredis
@@ -88,6 +89,92 @@ def round_to_tick(price: float, tick: float = TICK) -> str:
     """Round to nearest tick and return as string to avoid IEEE 754 issues."""
     decimals = max(0, -math.floor(math.log10(tick)))
     return f"{max(MIN_PRICE, round(price / tick) * tick):.{decimals}f}"
+
+
+# ─── Redis Subscriber ──────────────────────────────────────────────────────
+
+
+class RFQHandler(Protocol):
+    """Protocol for handling RFQ pub/sub events."""
+
+    async def on_new_rfq(self, rfq_id: int, data: dict) -> None:
+        """Called when a new open RFQ is received."""
+        ...
+
+    async def on_rfq_update(self, rfq_id: int, data: dict) -> None:
+        """Called when an existing RFQ state changes."""
+        ...
+
+    async def on_quote_update(self, quote_id: int) -> None:
+        """Called when a quote state changes."""
+        ...
+
+    async def on_trade(self, rfq_id: int) -> None:
+        """Called when a trade occurs on an RFQ."""
+        ...
+
+
+class RedisSubscriber:
+    """Subscribes to Redis pub/sub and dispatches events to a handler."""
+
+    def __init__(self, redis_url: str, channel: str, handler: RFQHandler):
+        self.redis_url = redis_url
+        self.channel = channel
+        self.handler = handler
+        self._redis: aioredis.Redis | None = None
+
+    async def start(self) -> None:
+        """Connect to Redis and start the subscription loop."""
+        self._redis = await aioredis.from_url(self.redis_url, decode_responses=True)
+        log.info(f"RedisSubscriber connected to {self.redis_url}")
+
+    async def stop(self) -> None:
+        """Close the Redis connection."""
+        if self._redis:
+            await self._redis.close()
+            self._redis = None
+
+    async def run(self) -> None:
+        """Subscribe and dispatch messages to handler. Call start() first."""
+        if not self._redis:
+            raise RuntimeError("RedisSubscriber not started. Call start() first.")
+
+        pubsub = self._redis.pubsub()
+        await pubsub.subscribe(self.channel)
+        log.info(f"Subscribed to {self.channel}")
+
+        try:
+            async for message in pubsub.listen():
+                if message["type"] != "message":
+                    continue
+                try:
+                    payload = json.loads(message["data"])
+                    await self._dispatch(payload)
+                except Exception as e:
+                    log.error(f"Error processing pub/sub message: {e}", exc_info=True)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await pubsub.unsubscribe(self.channel)
+
+    async def _dispatch(self, payload: dict) -> None:
+        """Route a message to the appropriate handler method."""
+        msg_type = payload.get("type")
+        msg_id = payload.get("id")
+
+        if msg_type == "rfq":
+            data = payload.get("data", {})
+            state = data.get("state", "")
+            if state == "open":
+                await self.handler.on_new_rfq(msg_id, data)
+            else:
+                await self.handler.on_rfq_update(msg_id, data)
+
+        elif msg_type == "rfq_quote":
+            await self.handler.on_quote_update(msg_id)
+
+        elif msg_type == "rfq_trade":
+            await self.handler.on_trade(msg_id)
 
 
 # ─── Quote state ───────────────────────────────────────────────────────────
@@ -308,9 +395,9 @@ class MMBot:
         last = qs.last_edit_at or qs.submitted_at
         return (time.time() - last) >= self.cooldown
 
-    # ── RFQ handling ──────────────────────────────────────────────────
+    # ── RFQ handling (RFQHandler protocol) ─────────────────────────────
 
-    async def handle_new_rfq(self, rfq_id: int, rfq_data: dict):
+    async def on_new_rfq(self, rfq_id: int, rfq_data: dict) -> None:
         """Quote a new RFQ with two-sided quotes."""
         if rfq_id in self.contexts:
             return  # already tracking
@@ -344,7 +431,7 @@ class MMBot:
             log.warning(f"Failed to submit any quotes for rfq={rfq_id}")
             del self.contexts[rfq_id]
 
-    async def handle_rfq_update(self, rfq_id: int, rfq_data: dict):
+    async def on_rfq_update(self, rfq_id: int, rfq_data: dict) -> None:
         """Handle RFQ state change (expired, cancelled, etc.)."""
         ctx = self.contexts.get(rfq_id)
         if not ctx:
@@ -354,7 +441,7 @@ class MMBot:
             log.info(f"RFQ {rfq_id} → {state}, removing context")
             del self.contexts[rfq_id]
 
-    async def handle_quote_update(self, quote_id: int):
+    async def on_quote_update(self, quote_id: int) -> None:
         """Handle quote state change from rfq_quote pub/sub."""
         # Find the context that owns this quote
         for ctx in self.contexts.values():
@@ -381,6 +468,12 @@ class MMBot:
                                 ctx.sell_quote = None
                             break
                 return
+
+    async def on_trade(self, rfq_id: int) -> None:
+        """Handle trade event — remove RFQ context."""
+        if rfq_id in self.contexts:
+            log.info(f"Trade on rfq={rfq_id}, removing context")
+            del self.contexts[rfq_id]
 
     # ── Price refresh loop ────────────────────────────────────────────
 
@@ -417,43 +510,6 @@ class MMBot:
                         await self._edit_quote(ctx.sell_quote, new_legs)
 
                 ctx.last_prices = prices
-
-    # ── Pub/sub listener ──────────────────────────────────────────────
-
-    async def _pubsub_loop(self):
-        """Listen for rfq_updates from Redis pub/sub."""
-        pubsub = self._redis.pubsub()
-        await pubsub.subscribe("rfq_updates")
-        log.info("Subscribed to rfq_updates")
-
-        async for message in pubsub.listen():
-            if message["type"] != "message":
-                continue
-            try:
-                payload = json.loads(message["data"])
-                msg_type = payload.get("type")
-                msg_id = payload.get("id")
-
-                if msg_type == "rfq":
-                    data = payload.get("data", {})
-                    state = data.get("state", "")
-                    if state == "open" and msg_id not in self.contexts:
-                        await self.handle_new_rfq(msg_id, data)
-                    else:
-                        await self.handle_rfq_update(msg_id, data)
-
-                elif msg_type == "rfq_quote":
-                    await self.handle_quote_update(msg_id)
-
-                elif msg_type == "rfq_trade":
-                    # If a trade happened, the RFQ might be done
-                    rfq_id = msg_id
-                    if rfq_id in self.contexts:
-                        log.info(f"Trade on rfq={rfq_id}, removing context")
-                        del self.contexts[rfq_id]
-
-            except Exception as e:
-                log.error(f"Error processing pub/sub message: {e}", exc_info=True)
 
     # ── Bootstrap: quote existing open RFQs ───────────────────────────
 
