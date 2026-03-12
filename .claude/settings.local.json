@@ -2,8 +2,15 @@
   "permissions": {
     "allow": [
       "Bash(ls /Users/xguo/workspace/rfq/*.sh)",
-      "Bash(ssh:*)",
-      "Bash(uv run:*)"
+      "Bash(ssh *)",
+      "Bash(uv run *)",
+      "WebFetch(domain:docs.deribit.com)",
+      "Bash(do echo:*)",
+      "Bash(ls:*)",
+      "Bash(uv run:*)",
+      "Bash(uv add:*)",
+      "Bash(uv pip:*)",
+      "Bash(scp:*)"
     ]
   }
 }

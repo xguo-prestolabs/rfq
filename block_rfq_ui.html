@@ -1001,7 +1001,7 @@ function applyEdge(id) {
     const input = document.getElementById(`lp-${id}-${i}`);
     if (!input) return;
     const edged = l.fair_price + ticks * OPTION_TICK_SIZE;
-    input.value = roundToTick(Math.max(0, edged));
+    input.value = roundToTick(Math.max(OPTION_TICK_SIZE, edged));
   });
 }
 
@@ -1012,7 +1012,7 @@ function collectLegs(id) {
     instrument_name: l.instrument_name,
     direction:        l.direction,
     ratio:            l.ratio,
-    price:            roundToTick(parseFloat(document.getElementById(`lp-${id}-${i}`)?.value || 0)),
+    price:            roundToTick(Math.max(OPTION_TICK_SIZE, parseFloat(document.getElementById(`lp-${id}-${i}`)?.value || 0))),
   }));
 }
 
@@ -1310,7 +1310,7 @@ async function updateRFQPrices(id) {
         const edgeTicks = S.edge[id] || 0;
         if (price !== null) {
           const edged = price + edgeTicks * OPTION_TICK_SIZE;
-          input.value = roundToTick(Math.max(0, edged));
+          input.value = roundToTick(Math.max(OPTION_TICK_SIZE, edged));
         } else {
           input.value = '';
         }
@@ -1484,11 +1484,14 @@ async function pollRecentTrades() {
       const dir = t.direction || '—';
       const amt = t.amount != null ? t.amount : '—';
       const ts  = t.timestamp ? fmtAgo(t.timestamp) : '—';
+      const price = t.price != null ? t.price : (t.trades && t.trades[0] ? t.trades[0].price : null);
       const legs = (t.legs || []).map(l => {
         const d = l.direction === 'buy' ? '<span class="pos">B</span>' : '<span class="neg">S</span>';
-        return `${d} ${esc(l.instrument_name)}`;
+        const lp = l.price != null ? ` @ ${l.price}` : '';
+        return `${d} ${esc(l.instrument_name)}${lp}`;
       }).join('<br>');
       const dirCls = dir === 'buy' ? 'pos' : 'neg';
+      const priceStr = price != null ? `<span class="mono" style="font-size:11px"> @ ${price}</span>` : '';
       return `<div class="trade-card">
         <div class="trade-card-header">
           <span class="trade-id">#${t.id ?? t.block_rfq_id ?? '?'}</span>
@@ -1496,7 +1499,7 @@ async function pollRecentTrades() {
         </div>
         <div style="margin-bottom:3px">
           <span class="${dirCls}" style="font-size:11px;font-weight:600">${dir.toUpperCase()}</span>
-          <span class="mono" style="font-size:11px"> ${amt}</span>
+          <span class="mono" style="font-size:11px"> ${amt}</span>${priceStr}
         </div>
         <div class="trade-leg">${legs}</div>
       </div>`;

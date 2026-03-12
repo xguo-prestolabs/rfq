@@ -34,6 +34,6 @@
   },
   "local_file": {
     "enabled": true,
-    "path": "rfq_messages.jsonl"
+    "path": "rfq_messages_testnet.jsonl"
   }
 }

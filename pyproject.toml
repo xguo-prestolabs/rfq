@@ -9,6 +9,7 @@ dependencies = [
     "aiohttp>=3.8.6",
     "certifi>=2025.4.26",
     "fastapi>=0.83.0",
+    "influxdb-client[async]>=1.50.0",
     "prometheus-client>=0.17.1",
     "pymongo>=4.16.0",
     "pyzmq>=25.1.2",
